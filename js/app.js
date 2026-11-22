@@ -14,6 +14,7 @@ const ui = {
   prOpen: new Set(),    // exercises expanded in the PR overview
   pickerQuery: '',      // add-exercise search text
   pickerCollapsed: new Set(), // collapsed groups in the add-exercise sheet
+  skillsOpen: new Set(),  // expanded groups in Settings → Skills (all folded by default)
   drafts: {},          // exId -> { level, bands[], bandMode, value, addedKg } for the active session
   sheet: null,         // { type, id }
   timer: null,         // hold timer state
@@ -301,9 +302,19 @@ function viewSkills() {
   const groups = GROUPS.map((g) => ({ g, items: list.filter((e) => (e.group || 'Other') === g) })).filter((x) => x.items.length);
   return `
     <div class="spread view-head"><h2>Progressions</h2><button class="btn sm" data-act="edit-ex" data-id="new">+ New</button></div>
-    ${groups.map(({ g, items }) => `
-      <div class="label" style="margin:16px 0 8px">${esc(g)}</div>
-      ${items.map(skillCard).join('')}`).join('')}
+    ${groups.map(({ g, items }) => {
+      const open = ui.skillsOpen.has(g);
+      const ready = items.filter((ex) => S.readiness(ex).ready).length;
+      return `
+      <section class="skill-group ${open ? 'open' : ''}">
+        <button class="pick-head" data-act="skills-group" data-g="${g}" aria-expanded="${open}">
+          <span class="dot g-${g.toLowerCase()}"></span><span class="label">${esc(g)}</span>
+          ${ready ? `<span class="badge ready">${ready} ready</span>` : ''}
+          <span class="small muted pick-count">${items.length}</span><span class="pick-chev">▾</span>
+        </button>
+        ${open ? `<div class="skill-group-body">${items.map(skillCard).join('')}</div>` : ''}
+      </section>`;
+    }).join('')}
     ${archived.length ? `
       <button class="btn ghost block" style="margin-top:16px" data-act="toggle-archived">${ui.showArchived ? 'Hide' : 'Show'} archived (${archived.length})</button>
       ${ui.showArchived ? archived.map(skillCard).join('') : ''}` : ''}`;
@@ -311,21 +322,22 @@ function viewSkills() {
 
 function skillCard(ex) {
   const r = S.readiness(ex);
+  const top = S.prsFor(ex.id).top;
   return `
     <div class="card tap" data-act="open-ex" data-id="${ex.id}">
       <div class="spread">
         <div>
           <h3>${esc(ex.name)}</h3>
-          <div class="small muted">L${ex.currentLevel + 1}/${ex.levels.length} · <span style="color:var(--text)">${esc(ex.levels[ex.currentLevel])}</span>${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</div>
+          <div class="small muted">${ex.levels.length} levels${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</div>
         </div>
         ${r.ready ? '<span class="badge ready">Level up</span>' : r.isLast && r.hits >= 2 ? '<span class="badge ready">Mastered</span>' : `<span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${ex.kind === 'static' ? 'Hold' : 'Reps'}</span>`}
       </div>
-      ${ladderBar(ex)}
-      <div class="spread small muted" style="margin-top:10px">
-        <span>Best clean ${r.bestClean ? fmtVal(ex, r.bestClean) : '—'} / ${fmtVal(ex, ex.goal)}</span>
-        ${r.bestAny && S.isAssisted(r.bestAny) ? `<span class="row">best ${fmtVal(ex, r.bestAny.value)} ${loadInline(r.bestAny)}</span>` : ''}
+      <div class="skill-top small">
+        ${top
+          ? `<span class="muted">Highest reached:</span> <b>${esc(top.levelName)}</b>${top.tempo ? ` ${tempoTag(top)}` : ''}
+             <span class="skill-pr">${esc(fmtVal(ex, top.value))}${S.isAssisted(top) ? ' <span class="muted">· band</span>' : ''}</span>`
+          : '<span class="muted">Not trained yet</span>'}
       </div>
-      <div class="goalbar" style="margin-top:6px"><b style="width:${(r.pct * 100).toFixed(0)}%"></b></div>
     </div>`;
 }
 
@@ -572,7 +584,7 @@ function prRowCompact(ex, pr) {
     <div class="pr-row ${open ? 'open' : ''}">
       <button class="pr-main" data-act="pr-toggle" data-id="${ex.id}" aria-expanded="${open}">
         <span class="pr-name"><b>${esc(ex.name)}</b>
-          <span class="small muted">L${top.level + 1}/${ex.levels.length} · ${esc(top.levelName)}${top.tempo ? ` · ${esc(TEMPOS[top.tempo].toLowerCase())}` : ''}${S.isAssisted(top) ? ' · band' : ''}</span></span>
+          <span class="small muted">${esc(top.levelName)}${top.tempo ? ` · ${esc(TEMPOS[top.tempo].toLowerCase())}` : ''}${S.isAssisted(top) ? ' · band' : ''}</span></span>
         <span class="pr-num">${esc(top.value)}<small>${ex.kind === 'static' ? 's' : ''}</small></span>
         <span class="pr-chev">${open ? '▴' : '▾'}</span>
       </button>
@@ -1066,6 +1078,7 @@ const actions = {
     for (const s of state.sessions) { s.sets = s.sets.filter((x) => x.exId !== ex.id); s.exerciseIds = s.exerciseIds.filter((id) => id !== ex.id); }
     S.save(); closeSheet(); render();
   },
+  'skills-group': (el) => { const g = el.dataset.g; ui.skillsOpen.has(g) ? ui.skillsOpen.delete(g) : ui.skillsOpen.add(g); render(); },
   'toggle-archived': () => { ui.showArchived = !ui.showArchived; render(); },
   'close-sheet': () => closeSheet(),
   'add-band': () => {

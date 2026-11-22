@@ -5,7 +5,7 @@ const KEY = 'calisthenics-log-v1';
 
 export const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
-const CURRENT_VERSION = 5;
+const CURRENT_VERSION = 6;
 
 const fromTemplate = (t) => ({
   id: uid(),
@@ -62,6 +62,15 @@ export function migrate(s) {
     }
   }
   if (s.version < 4) remapLegacyLadders(s);
+  if (s.version < 6) {
+    // v6: Ring support removed from the starter skills (kept if it was ever logged).
+    const rs = s.exercises.find((e) => e.name === 'Ring support');
+    const used = rs && (s.sessions.some((x) => x.sets.some((y) => y.exId === rs.id)) || s.manualPRs.some((p) => p.exId === rs.id));
+    if (rs && !used) {
+      s.exercises = s.exercises.filter((e) => e !== rs);
+      for (const x of s.sessions) x.exerciseIds = x.exerciseIds.filter((id) => id !== rs.id);
+    }
+  }
   if (s.version < 5) {
     // v5: per-skill load options. Defaults from the template, but never hide an
     // option the user has already logged with.

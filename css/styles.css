@@ -440,3 +440,14 @@ button.topbar-meta::before { content: '●'; color: var(--accent); margin-right:
 .view-head { margin: 4px 0 14px; }
 .view-head h2 { margin: 0; }
 .view-head + .gfilter { margin-top: 0; }
+
+/* Settings → Skills: collapsible groups */
+.skill-group { margin-top: 4px; }
+.skill-group .pick-head { min-height: 48px; }
+.skill-group .badge.ready { margin-left: 4px; }
+.skill-group:not(.open) .pick-chev { transform: rotate(-90deg); }
+.skill-group-body { padding: 10px 0 6px; }
+
+.skill-top { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.skill-top .skill-pr { margin-left: auto; font: 700 17px/1 var(--display); font-variant-numeric: tabular-nums; }
+.skill-top .skill-pr .muted { font: 500 12px var(--body); }

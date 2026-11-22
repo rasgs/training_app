@@ -57,8 +57,6 @@ export const TEMPLATES = [
   { name: 'Ring dip', equipment: 'rings', bands: true, weight: true, kind: 'reps', group: 'Push', goal: 10,
     levels: ['Ring dip negative', 'Ring dip', 'RTO dip', 'Bulgarian dip', 'Ring L-sit dip', 'Ring wide dip',
       'RTO 45° dip', 'RTO 90° dip'] },
-  { name: 'Ring support', equipment: 'rings', bands: false, weight: false, kind: 'static', group: 'Push', goal: 30,
-    levels: ['Support hold (bars)', 'Ring support hold', 'RTO support hold'] },
   { name: 'Bridge', equipment: 'none', bands: false, weight: false, kind: 'static', group: 'Push', goal: 30,
     levels: ['Reverse plank', 'Shoulder bridge', 'Table bridge', 'Angled bridge', 'Head bridge', 'Bridge / wheel',
       'Decline bridge', 'One leg bridge'] },
