@@ -4,8 +4,20 @@
     {
       "name": "ladder",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["serve.py", "5173"],
+      "runtimeArgs": [
+        "serve.py",
+        "5173"
+      ],
       "port": 5173
+    },
+    {
+      "name": "ladder-test",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "serve.py",
+        "5174"
+      ],
+      "port": 5174
     }
   ]
 }

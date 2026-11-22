@@ -5,7 +5,7 @@ const KEY = 'calisthenics-log-v1';
 
 export const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
-const CURRENT_VERSION = 6;
+const CURRENT_VERSION = 7;
 
 const fromTemplate = (t) => ({
   id: uid(),
@@ -31,6 +31,7 @@ function seed() {
     restSeconds: 90,
     historyView: 'list',
     manualPRs: [],
+    workouts: [],
   };
 }
 
@@ -47,6 +48,12 @@ export function migrate(s) {
   }
   s.historyView ??= 'list';
   s.manualPRs ??= [];
+  s.workouts ??= []; // v7: saved workouts
+  if (s.restOn === undefined) {
+    // Rest timer on/off switch; "0 seconds" used to mean off.
+    s.restOn = Number(s.restSeconds ?? 90) > 0;
+    if (!Number(s.restSeconds)) s.restSeconds = 90;
+  }
   if (s.version < 3) {
     // v3: progressions rebuilt from the r/bodyweightfitness chart. Exercises with
     // logged sets or PRs keep their levels (history is stored by level index);
@@ -233,11 +240,56 @@ export const activeSession = () => state.sessions.find((s) => s.id === state.act
 
 // ---------- sessions ----------
 export function startSession() {
-  const s = { id: uid(), startedAt: Date.now(), endedAt: null, exerciseIds: [], sets: [] };
+  const s = { id: uid(), startedAt: Date.now(), endedAt: null, exerciseIds: [], sets: [], plans: {} };
   state.sessions.push(s);
   state.activeSessionId = s.id;
   save();
   return s;
+}
+
+/** Plan text for an exercise in the active session ("3x10"), or ''. */
+export const planFor = (exId) => activeSession()?.plans?.[exId] || '';
+
+export function setPlan(exId, text) {
+  const s = activeSession();
+  if (!s) return;
+  s.plans ||= {};
+  if (text) s.plans[exId] = text; else delete s.plans[exId];
+  save();
+}
+
+// ---------- saved workouts ----------
+/** items: [{ exId, plan }] */
+export function saveWorkout({ id, name, items }) {
+  const existing = id && state.workouts.find((w) => w.id === id);
+  if (existing) Object.assign(existing, { name, items });
+  else state.workouts.push({ id: uid(), name, items, createdAt: Date.now() });
+  save();
+}
+
+export function deleteWorkout(id) {
+  state.workouts = state.workouts.filter((w) => w.id !== id);
+  save();
+}
+
+/** Start a session pre-filled with a saved workout's exercises and plans. */
+export function startFromWorkout(id) {
+  const w = state.workouts.find((x) => x.id === id);
+  if (!w) return null;
+  const s = startSession();
+  for (const it of w.items) {
+    if (!exById(it.exId) || s.exerciseIds.includes(it.exId)) continue;
+    s.exerciseIds.push(it.exId);
+    if (it.plan) s.plans[it.exId] = it.plan;
+  }
+  save();
+  return s;
+}
+
+/** The active session as saveable workout items. */
+export function sessionAsItems() {
+  const s = activeSession();
+  return s ? s.exerciseIds.map((exId) => ({ exId, plan: s.plans?.[exId] || '' })) : [];
 }
 
 export function finishSession() {
@@ -277,6 +329,10 @@ export function logSet(exId, draft) {
     bandMode: draft.bandMode,
     addedKg: ex.allowWeight === false ? 0 : Number(draft.addedKg) || 0,
     tempo: ex.kind === 'reps' ? draft.tempo || null : null,
+    equipment: ex.equipment || 'none',
+    // Cluster set: value is the total, parts are the mini-sets (e.g. [4,3,3]).
+    ...(Array.isArray(draft.cluster) && draft.cluster.length > 1
+      ? { cluster: draft.cluster.map(Number), clusterRest: Number(draft.clusterRest) || 0 } : {}),
     at: Date.now(),
   };
   s.sets.push(set);
@@ -285,10 +341,50 @@ export function logSet(exId, draft) {
   return set;
 }
 
+/** Removes a set; returns what's needed to undo it. */
 export function deleteSet(sessionId, setId) {
   const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s) return null;
+  const index = s.sets.findIndex((x) => x.id === setId);
+  if (index < 0) return null;
+  const [set] = s.sets.splice(index, 1);
+  save();
+  return { sessionId, set, index };
+}
+
+/** Edit a logged set: { value, level, bands, addedKg, tempo }. */
+export function updateSet(sessionId, setId, patch) {
+  const set = state.sessions.find((x) => x.id === sessionId)?.sets.find((x) => x.id === setId);
+  const ex = set && exById(set.exId);
+  if (!set || !ex) return;
+  if (patch.value !== undefined) set.value = Math.max(0, Number(patch.value) || 0);
+  if (patch.level !== undefined) {
+    set.level = Math.max(0, Math.min(ex.levels.length - 1, Number(patch.level) || 0));
+    set.levelName = ex.levels[set.level];
+  }
+  if (patch.bands) set.bands = [...patch.bands];
+  if (patch.addedKg !== undefined) set.addedKg = Math.max(0, Number(patch.addedKg) || 0);
+  if (patch.tempo !== undefined) set.tempo = ex.kind === 'reps' ? patch.tempo || null : null;
+  // A cluster whose total no longer matches its parts is just a normal set now.
+  if (set.cluster && set.cluster.reduce((a, b) => a + b, 0) !== set.value) delete set.cluster;
+  save();
+}
+
+export function restoreSet({ sessionId, set, index }) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s || s.sets.some((x) => x.id === set.id)) return;
+  s.sets.splice(Math.min(index, s.sets.length), 0, set);
+  if (!s.exerciseIds.includes(set.exId)) s.exerciseIds.push(set.exId);
+  save();
+}
+
+/** Move an exercise up (-1) or down (+1) in the active session. */
+export function moveExercise(exId, d) {
+  const s = activeSession();
   if (!s) return;
-  s.sets = s.sets.filter((x) => x.id !== setId);
+  const i = s.exerciseIds.indexOf(exId), j = i + d;
+  if (i < 0 || j < 0 || j >= s.exerciseIds.length) return;
+  [s.exerciseIds[i], s.exerciseIds[j]] = [s.exerciseIds[j], s.exerciseIds[i]];
   save();
 }
 
@@ -349,7 +445,7 @@ export function lastSetsFor(exId, excludeSessionId) {
 export function readiness(ex) {
   const lvl = ex.currentLevel;
   const atLevel = historyFor(ex.id)
-    .map((h) => ({ ...h, sets: h.sets.filter((x) => x.level === lvl) }))
+    .map((h) => ({ ...h, sets: h.sets.filter((x) => x.level === lvl && !x.cluster) }))
     .filter((h) => h.sets.length);
   const recent = atLevel.slice(-3);
   const best = (sets) => Math.max(0, ...sets.map((x) => x.value));
@@ -423,7 +519,7 @@ export function prsFor(exId) {
   const events = [];
   let maxLevel = -1;
   for (const e of entriesFor(exId)) {
-    const key = `${e.level}|${e.tempo || ''}`;
+    const key = `${e.level}|${e.tempo || ''}|${e.cluster ? 'cluster' : ''}`;
     const prev = byLevel[key];
     if (!prev || compareSets(e, prev) > 0) {
       byLevel[key] = e;
@@ -433,7 +529,8 @@ export function prsFor(exId) {
     maxLevel = Math.max(maxLevel, e.level);
   }
   // Highest level first; within a level, standard tempo before variants.
-  const levels = Object.values(byLevel).sort((a, b) => b.level - a.level || !!a.tempo - !!b.tempo);
+  const variant = (e) => (e.tempo ? 1 : 0) + (e.cluster ? 2 : 0);
+  const levels = Object.values(byLevel).sort((a, b) => b.level - a.level || variant(a) - variant(b));
   return { levels, events, top: levels[0] || null };
 }
 

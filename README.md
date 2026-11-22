@@ -25,6 +25,15 @@ Use **History → Export JSON** for backups.
 | Band mode | Assist (easier) or Resist (harder), plus optional added kg |
 | Value | Hold seconds (statics, with a built-in hold timer) or reps |
 
+## Workouts and notation
+
+Each exercise in a session can have a plan in standard notation: `3x10`, `4x15s` for holds,
+or a cluster `3x(4+3+3)` (default 15 s between parts, or `3x(4+3+3)/20s`). The card shows
+which set you're on, and clusters get a timer that runs each part and the short rests.
+
+Saved workouts are written as text, one exercise per line (`Pull-up 3x8`), or saved from the
+current session, and started from the Workout tab.
+
 ## Progress logic
 
 - Sets are ranked by **level first**, then **net assistance** (from each band's kg range),
@@ -37,6 +46,7 @@ Use **History → Export JSON** for backups.
 
 ## Files
 
+- `js/plan.js`: workout notation parser (`3x10`, clusters) and workout-text parsing
 - `js/data.js`: default bands, progression templates (with bar/rings equipment), all editable in the app
 - `js/store.js`: state, persistence, ranking and readiness logic
 - `js/app.js`: UI, hold timer, rest timer

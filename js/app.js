@@ -1,6 +1,7 @@
 // UI: rendering + event handling. Plain ES modules, no build step.
 import * as S from './store.js';
 import { GROUPS, EQUIPMENT, TEMPOS } from './data.js';
+import { parsePlan, formatPlan, parseWorkoutText } from './plan.js';
 
 const { state } = S;
 
@@ -13,7 +14,10 @@ const ui = {
   prGroups: new Set(),  // PR view muscle-group filter
   prOpen: new Set(),    // exercises expanded in the PR overview
   pickerQuery: '',      // add-exercise search text
-  pickerCollapsed: new Set(), // collapsed groups in the add-exercise sheet
+  pickerCollapsed: new Set(GROUPS), // collapsed groups in the add-exercise sheet (all folded at start)
+  exCollapsed: new Set(),  // exercise cards folded in the workout view
+  optsOpen: new Set(),     // exercise cards with 'More options' open
+  lastDeleted: null,       // for undoing a swiped-away set
   skillsOpen: new Set(),  // expanded groups in Settings → Skills (all folded by default)
   drafts: {},          // exId -> { level, bands[], bandMode, value, addedKg } for the active session
   sheet: null,         // { type, id }
@@ -55,20 +59,25 @@ function loadInline(set) {
       <span class="small muted">${set.bandMode === 'assist' ? 'assist' : 'resist'}</span>`);
   }
   if (set.addedKg) parts.push(`<span class="small muted">+${esc(set.addedKg)} kg</span>`);
-  if (!parts.length) parts.push('<span class="small muted">clean</span>');
   return parts.join(' ');
 }
+
+const clusterTag = (set) => (Array.isArray(set.cluster) && set.cluster.length > 1
+  ? `<span class="badge tempo" title="Cluster set">${set.cluster.join('+')}</span>` : '');
+/** Parsed plan for an exercise in the active session, or null. */
+const planOf = (exId) => parsePlan(S.planFor(exId));
+
+/** Human label for a plan: "5 × 10", "4 × 15s", "3 × (4+3+3)". */
+const planLabel = (p, ex) => {
+  const u = ex.kind === 'static' ? 's' : '';
+  return p.cluster ? `${p.sets} × (${p.parts.join('+')})${u}` : `${p.sets} × ${p.perSet}${u}`;
+};
 
 const tempoTag = (set) => (set.tempo && TEMPOS[set.tempo]
   ? `<span class="badge tempo">${TEMPOS[set.tempo]}</span>` : '');
 
 const equipBadge = (ex) => (ex.equipment && ex.equipment !== 'none'
   ? `<span class="badge">${ex.equipment === 'rings' ? '◯◯' : '━'} ${EQUIPMENT[ex.equipment]}</span>` : '');
-
-function ladderBar(ex, lvl = ex.currentLevel) {
-  return `<div class="ladder" aria-label="Level ${lvl + 1} of ${ex.levels.length}">${ex.levels
-    .map((_, i) => `<i class="${i < lvl ? 'done' : i === lvl ? 'cur' : ''}"></i>`).join('')}</div>`;
-}
 
 // ---------- audio / wake lock ----------
 let audioCtx = null;
@@ -86,7 +95,8 @@ function beep(freq = 880, dur = 0.12, times = 1) {
       o.start(t); o.stop(t + dur + 0.02);
     }
   } catch { /* audio not available */ }
-  navigator.vibrate?.(times > 1 ? [80, 60, 80] : 60);
+  // Browsers only allow vibration after the user has tapped the page.
+  if (navigator.userActivation?.hasBeenActive ?? true) navigator.vibrate?.(times > 1 ? [80, 60, 80] : 60);
 }
 let wakeLock = null;
 async function holdWake(on) {
@@ -108,7 +118,7 @@ function draftFor(exId) {
           level: ex.currentLevel,
           // Carry bands over only if they were used at the same level.
           bands: prev.level === ex.currentLevel ? [...prev.bands] : [],
-          bandMode: prev.bandMode || 'assist',
+          bandMode: 'assist',
           value: prev.value,
           addedKg: prev.level === ex.currentLevel ? prev.addedKg || 0 : 0,
           tempo: prev.tempo || null,
@@ -117,6 +127,11 @@ function draftFor(exId) {
   }
   const d = ui.drafts[exId];
   d.level = clamp(d.level, 0, ex.levels.length - 1);
+  if (!d.planApplied) {
+    const p = planOf(exId);
+    if (p) d.value = p.perSet;
+    d.planApplied = true;
+  }
   return d;
 }
 
@@ -136,10 +151,15 @@ function viewWorkout() {
   if (!s) return viewWorkoutIdle();
   const cards = s.exerciseIds.map(S.exById).filter(Boolean).map((ex) => exCard(ex, s)).join('');
   return `
+    ${ui.rest || state.restOn === false ? '' : `<div class="row" style="justify-content:flex-end;margin-bottom:10px">
+      <button class="btn sm ghost" data-act="rest-start">⏱ Rest timer ${fmtClock(Number(state.restSeconds ?? 90))}</button></div>`}
     ${cards || '<div class="empty">Add the first exercise of today\'s session.</div>'}
     <div class="stack" style="margin-top:14px">
       <button class="btn block big" data-act="open-picker">+ Add exercise</button>
-      <button class="btn block ghost" data-act="finish-session">Finish session</button>
+      <div class="grid2">
+        <button class="btn ghost" data-act="wk-from-session">Save as workout</button>
+        <button class="btn ghost" data-act="finish-session">Finish session</button>
+      </div>
     </div>`;
 }
 
@@ -149,21 +169,35 @@ function viewWorkoutIdle() {
   const last = [...state.sessions].filter((x) => x.endedAt).sort((a, b) => b.startedAt - a.startedAt)[0];
   return `
     <div class="card hero">
-      <p class="big-title">Progress by <em>levels</em>,<br>not kilos.</p>
-      <p class="muted small" style="margin:0 0 16px">Log the progression step, the band you used and how long you held it.
-      Move up a level when you hit the goal.</p>
+      <p class="big-title">Time to <em>train</em>.</p>
+      <p class="muted small" style="margin:0 0 16px">Pick an exercise and log your sets. You'll get a nudge when it's time to move up a level.</p>
       <button class="btn primary block big" data-act="start-session">Start session</button>
     </div>
-    ${ready.length ? `<h2>Ready to level up</h2>${ready.map(({ ex }) => `
+    <div class="spread view-head" style="margin-top:22px"><h2>Workouts</h2><button class="btn sm" data-act="wk-edit" data-id="new">+ New</button></div>
+    ${state.workouts.length ? state.workouts.map((w) => `
+      <div class="card wk-card">
+        <div class="spread">
+          <h3>${esc(w.name)}</h3>
+          <div class="row">
+            <button class="icon-btn plain" data-act="wk-edit" data-id="${w.id}" aria-label="Edit ${esc(w.name)}">✎</button>
+            <button class="btn sm primary" data-act="wk-start" data-id="${w.id}">Start</button>
+          </div>
+        </div>
+        <div class="small muted wk-items">${w.items.map((it) => {
+          const ex = S.exById(it.exId);
+          return ex ? `<span>${esc(ex.name)}${it.plan ? ` <b>${esc(formatPlan(parsePlan(it.plan), ex.kind) || it.plan)}</b>` : ''}</span>` : '';
+        }).filter(Boolean).join('')}</div>
+      </div>`).join('')
+      : `<div class="empty small">Save a workout you repeat, like<br><code>Pull-up 3x8 · Dip 3x10 · Front lever 4x10s</code><br>and start it with one tap.</div>`}
+    ${ready.length ? `<h2>Ready to move up</h2>${ready.map(({ ex }) => `
       <div class="card tap" data-act="open-ex" data-id="${ex.id}">
-        <div class="spread"><h3>${esc(ex.name)}</h3><span class="badge ready">Level up</span></div>
+        <div class="spread"><h3>${esc(ex.name)}</h3><span class="badge ready">Move up</span></div>
         <div class="small muted" style="margin-top:4px">${esc(ex.levels[ex.currentLevel])} → <b style="color:var(--text)">${esc(ex.levels[ex.currentLevel + 1])}</b></div>
-        ${ladderBar(ex)}
       </div>`).join('')}` : ''}
     ${last ? `<h2>Last session</h2>${sessionCard(last, true)}` : ''}`;
 }
 
-function exCard(ex, session) {
+function exDetail(ex, session) {
   const d = draftFor(ex.id);
   const sets = session.sets.filter((x) => x.exId === ex.id);
   const prev = S.lastSetsFor(ex.id, session.id);
@@ -171,41 +205,41 @@ function exCard(ex, session) {
   const r = S.readiness(ex);
   const nextIsUp = r.ready && d.level === ex.currentLevel;
   const bandsSorted = [...state.bands].sort((a, b) => (a.widthMm || 0) - (b.widthMm || 0));
+  const idx = session.exerciseIds.indexOf(ex.id);
+  const last = session.exerciseIds.length - 1;
+  const plan = planOf(ex.id);
+  const planDone = sets.length;
+  const optsSummary = [d.tempo ? TEMPOS[d.tempo] : '', ex.equipment && ex.equipment !== 'none' ? EQUIPMENT[ex.equipment] : '']
+    .filter(Boolean).join(' · ');
 
   return `
-  <div class="card ex-card">
-    <div class="ex-head">
-      <div>
-        <h3>${esc(ex.name)}</h3>
-        <div class="row" style="margin-top:4px">
-          <span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${ex.kind === 'static' ? 'Static hold' : 'Reps'}</span>
-          ${equipBadge(ex)}
-          <span class="small muted">goal ${fmtVal(ex, ex.goal)}</span>
-        </div>
-      </div>
-      <button class="icon-btn plain" data-act="remove-ex" data-id="${ex.id}" aria-label="Remove ${esc(ex.name)} from session">×</button>
+  <div class="ex-detail">
+    <div class="sheet-head">
+      <div><h2>${esc(ex.name)}</h2><div class="small muted">${ex.kind === 'static' ? 'Hold' : 'Reps'} · goal ${fmtVal(ex, ex.goal)}</div></div>
+      <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
     </div>
-
-    <div class="stepper">
-      <button data-act="lvl" data-id="${ex.id}" data-d="-1" ${d.level <= 0 ? 'disabled' : ''} aria-label="Easier progression">‹</button>
-      <div class="st-mid">
-        <div class="st-lvl">Level ${d.level + 1} / ${ex.levels.length}</div>
-        <div class="st-name">${esc(ex.levels[d.level])}</div>
-      </div>
-      <button data-act="lvl" data-id="${ex.id}" data-d="1" ${d.level >= ex.levels.length - 1 ? 'disabled' : ''} aria-label="Harder progression">›</button>
+    <div class="plan-row">
+      ${plan
+        ? `<button class="plan-chip" data-act="plan-edit" data-id="${ex.id}" aria-label="Change sets and reps">${esc(planLabel(plan, ex))} <span class="muted">✎</span></button>`
+        : `<button class="btn sm ghost" data-act="plan-edit" data-id="${ex.id}">+ Sets × ${ex.kind === 'static' ? 'seconds' : 'reps'}</button>`}
+      ${plan ? `<div class="plan-progress" aria-label="${Math.min(planDone, plan.sets)} of ${plan.sets} sets done">
+        ${Array.from({ length: plan.sets }, (_, i) => `<i class="${i < planDone ? 'done' : i === planDone ? 'next' : ''}"></i>`).join('')}
+        <span class="small ${planDone >= plan.sets ? '' : 'muted'}">${planDone >= plan.sets ? 'Done ✓' : `Set ${planDone + 1} of ${plan.sets}`}</span>
+      </div>` : ''}
     </div>
-    ${ladderBar(ex, d.level)}
+    <label class="field level-field">
+      <span>Progression level</span>
+      <select class="input level-select" data-bind="level" data-id="${ex.id}" aria-label="Progression level">
+        ${ex.levels.map((name, i) => `<option value="${i}" ${i === d.level ? 'selected' : ''}>${esc(name)}</option>`).join('')}
+      </select>
+    </label>
     ${nextIsUp ? `<div class="hint"><span class="badge ready">Goal hit ${r.hits}×</span> Try <b style="color:var(--text)">${esc(ex.levels[d.level + 1])}</b>
-      <button class="btn sm" data-act="lvl" data-id="${ex.id}" data-d="1">Level up</button></div>` : ''}
+      <button class="btn sm" data-act="lvl" data-id="${ex.id}" data-d="1">Move up</button></div>` : ''}
 
     ${ex.allowBands !== false || ex.allowWeight !== false ? `<div class="section">
       ${ex.allowBands !== false ? `<div class="label" style="margin-bottom:6px">Resistance band</div>
       <div class="band-ctl">
         ${bandDropdown(ex, d, bandsSorted)}
-        <div class="seg" role="group" aria-label="Band mode">
-          <button data-act="mode" data-id="${ex.id}" data-m="assist" aria-pressed="${d.bandMode === 'assist'}">Assist</button>
-          <button data-act="mode" data-id="${ex.id}" data-m="resist" aria-pressed="${d.bandMode === 'resist'}">Resist</button>
-        </div>
       </div>` : ''}
       ${ex.allowWeight !== false ? `
         <label class="weight-row ${ex.allowBands !== false ? 'below' : ''}">
@@ -214,17 +248,24 @@ function exCard(ex, session) {
         </label>` : ''}
     </div>` : ''}
 
-    ${ex.kind === 'reps' ? `
-      <div class="section">
-        <div class="label" style="margin-bottom:6px">Tempo</div>
+    <details class="ex-opts" data-opts="${ex.id}" ${ui.optsOpen.has(ex.id) ? 'open' : ''}>
+      <summary><span>More options</span>${optsSummary ? `<span class="small">${esc(optsSummary)}</span>` : ''}</summary>
+      ${ex.kind === 'reps' ? `
+        <div class="label" style="margin:10px 0 6px">Tempo</div>
         <div class="seg seg-full" role="group" aria-label="Tempo">
           <button data-act="tempo" data-id="${ex.id}" data-t="" aria-pressed="${!d.tempo}">Standard</button>
           ${Object.entries(TEMPOS).map(([k, label]) => `
             <button data-act="tempo" data-id="${ex.id}" data-t="${k}" aria-pressed="${d.tempo === k}">${label}</button>`).join('')}
-        </div>
-      </div>` : ''}
+        </div>` : ''}
+      <div class="label" style="margin:10px 0 6px">Equipment</div>
+      <div class="seg seg-full" role="group" aria-label="Equipment">
+        ${Object.entries(EQUIPMENT).map(([k, label]) => `
+          <button data-act="equip" data-id="${ex.id}" data-e="${k}" aria-pressed="${(ex.equipment || 'none') === k}">${label}</button>`).join('')}
+      </div>
+    </details>
 
-    <div class="section value-row">
+    <div class="label" style="margin:14px 0 6px">Log a custom set</div>
+    <div class="value-row">
       <div class="counter">
         <button data-act="val" data-id="${ex.id}" data-d="-1" aria-label="Decrease">−</button>
         <div>
@@ -233,20 +274,111 @@ function exCard(ex, session) {
         </div>
         <button data-act="val" data-id="${ex.id}" data-d="1" aria-label="Increase">+</button>
       </div>
-      ${ex.kind === 'static' ? `<button class="btn hold-btn" data-act="hold" data-id="${ex.id}">▶ Timer</button>` : ''}
+      ${plan?.cluster
+        ? `<button class="btn hold-btn" data-act="cluster" data-id="${ex.id}" title="Run a ${plan.parts.join('+')} cluster with ${plan.clusterRest}s rests">▶ Cluster</button>`
+        : ex.kind === 'static' ? `<button class="btn hold-btn" data-act="hold" data-id="${ex.id}">▶ Timer</button>` : ''}
     </div>
+    ${plan?.cluster ? `<div class="small muted" style="margin-top:6px">Cluster ${plan.parts.join(' + ')}${ex.kind === 'static' ? 's' : ''} · ${plan.clusterRest}s between</div>` : ''}
     <button class="btn primary block big" style="margin-top:10px" data-act="log" data-id="${ex.id}">Log set</button>
 
-    ${sets.length ? `<ul class="sets">${sets.map((x, i) => `
-      <li>
-        <span class="s-n">${i + 1}</span>
-        <span><span class="small">${esc(x.levelName)}</span> ${tempoTag(x)}<br>${loadInline(x)}</span>
-        <span class="s-v">${esc(x.value)}<small>${unit(ex)}</small>${prIds.has(x.id) ? '<span class="s-pr">PR</span>' : ''}</span>
-        <button class="icon-btn plain" data-act="del-set" data-session="${session.id}" data-set="${x.id}" aria-label="Delete set">×</button>
-      </li>`).join('')}</ul>` : ''}
+    ${sets.length ? `<ul class="sets">${sets.map((x, i) => setRow(ex, x, session.id, i + 1, prIds)).join('')}</ul>
+      <div class="small muted swipe-hint">Swipe a set left to delete it</div>` : ''}
 
-    ${prev ? `<div class="hint"><span class="label">Last time</span> ${lastTimeLine(ex, prev.sets)}</div>` : ''}
+    ${prev ? `<div class="hint">${lastSessionLine(ex, prev)}</div>` : ''}
+    <div class="grid3 detail-tools">
+      <button class="btn ghost" data-act="ex-move" data-id="${ex.id}" data-d="-1" ${idx <= 0 ? 'disabled' : ''}>↑ Move up</button>
+      <button class="btn ghost" data-act="ex-move" data-id="${ex.id}" data-d="1" ${idx >= last ? 'disabled' : ''}>↓ Move down</button>
+      <button class="btn danger" data-act="remove-ex" data-id="${ex.id}">Remove</button>
+    </div>
   </div>`;
+}
+
+/**
+ * Compact exercise row (StrongLifts-style): name + plan summary, then one circle per set.
+ * Tap an open circle to complete it at the target; tap a done circle to take off one rep
+ * (or second); at zero it's removed (with Undo). "+" adds a set. "›" opens the details.
+ */
+function exCard(ex, session) {
+  const d = draftFor(ex.id);
+  const sets = session.sets.filter((x) => x.exId === ex.id);
+  const prev = S.lastSetsFor(ex.id, session.id);
+  const r = S.readiness(ex);
+  const plan = planOf(ex.id);
+  const target = plan ? plan.perSet : Number(d.value) || 1;
+  const slots = Math.max(plan ? plan.sets : 0, sets.length);
+  const u = ex.kind === 'static' ? 's' : '';
+  const unitWord = ex.kind === 'static' ? 'seconds' : 'reps';
+  const chosen = ex.allowBands !== false ? d.bands.map(S.bandById).filter(Boolean) : [];
+  const sub = [
+    esc(ex.levels[d.level]),
+    chosen.length ? `<span class="band-inline">${chosen.map((b) => swatch(b)).join('')}</span>` : '',
+    ex.allowWeight !== false && d.addedKg ? `+${esc(d.addedKg)} kg` : '',
+    ex.kind === 'reps' && d.tempo ? esc(TEMPOS[d.tempo].toLowerCase()) : '',
+  ].filter(Boolean).join(' · ');
+  const nextIdx = sets.length;
+
+  const circles = Array.from({ length: slots }, (_, i) => {
+    const set = sets[i];
+    if (set) {
+      const short = set.value < target;
+      return `<button class="set-circle done ${short ? 'short' : ''}" data-act="set-edit" data-session="${session.id}" data-set="${set.id}"
+        aria-label="Set ${i + 1}: ${set.value} ${unitWord}. Tap to edit">${esc(set.value)}${u}</button>`;
+    }
+    return `<button class="set-circle ${i === nextIdx ? 'next' : ''}" data-act="set-do" data-id="${ex.id}"
+      aria-label="Set ${i + 1}: complete ${target} ${unitWord}">${target}${u}</button>`;
+  }).join('');
+
+  return `
+  <div class="card ex-row">
+    <button class="ex-row-head" data-act="ex-detail" data-id="${ex.id}" aria-label="${esc(ex.name)} details">
+      <span class="ex-row-name"><span class="h3">${esc(ex.name)}</span><span class="small muted">${sub}</span></span>
+      <span class="ex-row-plan">${plan ? esc(planLabel(plan, ex)) : '<span class="muted">No plan</span>'}<span class="chev">›</span></span>
+    </button>
+    <div class="set-circles">
+      ${circles}
+      <button class="set-circle add" data-act="set-add" data-id="${ex.id}" aria-label="Add a set of ${target} ${unitWord}">+</button>
+    </div>
+    ${r.ready && d.level === ex.currentLevel ? `<div class="hint"><span class="badge ready">Goal hit ${r.hits}×</span>
+      Ready for <b style="color:var(--text)">${esc(ex.levels[d.level + 1])}</b>
+      <button class="btn sm" data-act="lvl" data-id="${ex.id}" data-d="1">Move up</button></div>` : ''}
+    ${prev ? `<div class="hint">${lastSessionLine(ex, prev)}</div>` : ''}
+  </div>`;
+}
+
+/** "Last session (Sun 22 Nov): Pull-up, slow · 6 + 5 reps" */
+function lastSessionLine(ex, prev) {
+  const groups = [];
+  for (const x of prev.sets) {
+    const key = `${x.level}|${x.tempo || ''}|${x.cluster ? 'c' : ''}|${x.bands.join(',')}|${x.addedKg || 0}`;
+    const g = groups.at(-1);
+    if (g && g.key === key) g.vals.push(x.value);
+    else groups.push({ key, set: x, vals: [x.value] });
+  }
+  const unitWord = ex.kind === 'static' ? 's' : ' reps';
+  const body = groups.map(({ set, vals }) => {
+    const bits = [esc(set.levelName)];
+    if (set.tempo) bits.push(esc(TEMPOS[set.tempo].toLowerCase()));
+    const bands = set.bands.map(S.bandById).filter(Boolean);
+    if (bands.length) bits.push(`${bands.map((b) => esc(b.name.toLowerCase())).join(' + ')} band`);
+    if (set.addedKg) bits.push(`+${esc(set.addedKg)} kg`);
+    const v = set.cluster ? vals.map((n, i) => (i === 0 ? `${n} (${set.cluster.join('+')})` : n)) : vals;
+    return `${bits.join(', ')} · ${v.join(' + ')}${unitWord}`;
+  }).join('; ');
+  return `<span class="label">Last session (${esc(fmtDate(prev.session.startedAt))})</span> <span>${body}</span>`;
+}
+
+/** One logged set. Swipe left (touch or mouse) to delete; see initSwipe(). */
+function setRow(ex, x, sessionId, n, prIds = new Set()) {
+  const load = loadInline(x);
+  return `
+    <li class="swipe" data-act="set-edit" data-session="${sessionId}" data-set="${x.id}" tabindex="0" aria-label="Edit set ${n}">
+      <div class="swipe-bg" aria-hidden="true">Delete</div>
+      <div class="swipe-fg">
+        <span class="s-n">${n}</span>
+        <span><span class="small">${esc(x.levelName)}</span> ${tempoTag(x)}${clusterTag(x)}${load ? `<br>${load}` : ''}</span>
+        <span class="s-v">${esc(x.value)}<small>${unit(ex)}</small>${prIds.has(x.id) ? '<span class="s-pr">PR</span>' : ''}</span>
+      </div>
+    </li>`;
 }
 
 /** Compact multi-select dropdown: closed it shows the chosen band(s); open it lists the inventory. */
@@ -286,12 +418,12 @@ function closeBandMenu() {
 function lastTimeLine(ex, sets) {
   const groups = [];
   for (const x of sets) {
-    const key = `${x.level}|${x.tempo || ''}|${loadInline(x)}`;
+    const key = `${x.level}|${x.tempo || ''}|${x.cluster ? 'c' : ''}|${loadInline(x)}`;
     const g = groups.at(-1);
     if (g && g.key === key) g.vals.push(x.value);
     else groups.push({ key, level: x.level, set: x, vals: [x.value] });
   }
-  return groups.map((g) => `<span class="row" style="gap:5px"><span class="small">L${g.level + 1}</span>${tempoTag(g.set)}
+  return groups.map((g) => `<span class="row" style="gap:5px"><span class="small">${esc(g.set.levelName)}</span>${tempoTag(g.set)}${clusterTag(g.set)}
     <span class="num" style="color:var(--text)">${g.vals.map((v) => esc(fmtVal(ex, v))).join(' / ')}</span>${loadInline(g.set)}</span>`).join('<span class="muted">·</span>');
 }
 
@@ -330,7 +462,7 @@ function skillCard(ex) {
           <h3>${esc(ex.name)}</h3>
           <div class="small muted">${ex.levels.length} levels${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</div>
         </div>
-        ${r.ready ? '<span class="badge ready">Level up</span>' : r.isLast && r.hits >= 2 ? '<span class="badge ready">Mastered</span>' : `<span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${ex.kind === 'static' ? 'Hold' : 'Reps'}</span>`}
+        ${r.ready ? '<span class="badge ready">Move up</span>' : r.isLast && r.hits >= 2 ? '<span class="badge ready">Mastered</span>' : `<span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${ex.kind === 'static' ? 'Hold' : 'Reps'}</span>`}
       </div>
       <div class="skill-top small">
         ${top
@@ -352,7 +484,7 @@ function sheetExercise(ex) {
         <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
       </div>
     </div>
-    <div class="label">Progression ladder · tap to set your working level</div>
+    <div class="label">Progressions · tap the one you're working on</div>
     <ul class="levels card" style="padding:4px 10px;margin-top:8px">
       ${ex.levels.map((name, i) => {
         const best = S.bestOf(hist.flatMap((h) => h.sets).filter((x) => x.level === i));
@@ -373,11 +505,14 @@ function sheetExercise(ex) {
         <div class="spread"><b>${fmtDate(h.session.startedAt)}</b><span class="small muted">${h.sets.length} set${h.sets.length > 1 ? 's' : ''}</span></div>
         <ul class="sets" style="border-top:0;margin-top:4px">
           ${h.sets.map((x) => `<li style="grid-template-columns:1fr auto">
-            <span><span class="small">L${x.level + 1} · ${esc(x.levelName)}</span><br>${loadInline(x)}</span>
+            <span><span class="small">${esc(x.levelName)}</span> ${tempoTag(x)}${clusterTag(x)}<br>${loadInline(x)}</span>
             <span class="s-v">${esc(x.value)}<small>${unit(ex)}</small></span></li>`).join('')}
         </ul>
       </div>`).join('') : '<div class="empty small">No sets logged yet.</div>'}`;
 }
+
+/** Trim a progression name to fit a chart column (about `max` characters). */
+const shortName = (name, max) => (name.length <= max ? name : `${name.slice(0, Math.max(3, Math.floor(max) - 1))}…`);
 
 /**
  * Progress chart: best set per session. Shaded columns = progression level,
@@ -412,7 +547,7 @@ function chart(ex) {
     const x0 = Math.max(pl - 6, x(s.start) - step / 2), x1 = Math.min(W - pr + 4, x(s.end) + step / 2);
     return `<rect x="${x0.toFixed(1)}" y="${pt - 14}" width="${(x1 - x0).toFixed(1)}" height="${H - pt - pb + 14}"
         style="fill:var(--surface-2);opacity:${k % 2 ? 0.35 : 0.9}"/>
-      <text class="lvl-label" x="${(x0 + 4).toFixed(1)}" y="${pt - 4}">L${s.level + 1}</text>`;
+      <text class="lvl-label" x="${(x0 + 4).toFixed(1)}" y="${pt - 4}">${esc(shortName(ex.levels[s.level] || '', (x1 - x0) / 5.5))}</text>`;
   }).join('');
   const lines = segs.map((s) => {
     const pts = hist.slice(s.start, s.end + 1).map((h, j) => `${x(s.start + j).toFixed(1)},${y(h.top.value).toFixed(1)}`).join(' ');
@@ -433,9 +568,8 @@ function chart(ex) {
       <text x="${W - pr}" y="${H - 3}" text-anchor="end">${esc(fmtDate(hist.at(-1).session.startedAt))}</text>
     </svg>
     <div class="legend">
-      <span><span class="dot" style="background:var(--accent)"></span>clean</span>
+      <span><span class="dot" style="background:var(--accent)"></span>no band</span>
       <span><span class="dot" style="background:var(--muted)"></span>dot = assisting band color</span>
-      <span>L = progression level</span>
     </div>`;
 }
 
@@ -508,7 +642,7 @@ function sheetPicker() {
           const added = s?.exerciseIds.includes(ex.id);
           const search = [ex.name, g, EQUIPMENT[ex.equipment] || '', ...ex.levels].join(' ').toLowerCase();
           return `<li class="${added ? 'added' : ''}" data-act="pick-ex" data-id="${ex.id}" data-search="${esc(search)}">
-            <span><b>${esc(ex.name)}</b><br><span class="small muted">L${ex.currentLevel + 1} · ${esc(ex.levels[ex.currentLevel])}${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</span></span>
+            <span><b>${esc(ex.name)}</b><br><span class="small muted">${esc(ex.levels[ex.currentLevel])}${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</span></span>
             <span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${added ? 'Added' : ex.kind === 'static' ? 'Hold' : 'Reps'}</span>
           </li>`;
         }).join('')}</ul>
@@ -561,7 +695,7 @@ function viewPRs() {
       <div class="label" style="margin:16px 0 6px">Recent</div>
       <ul class="pr-recent">${recent.map((ev) => `
         <li>
-          <span class="pr-star ${ev.type === 'level' ? 'lvl' : ''}" title="${ev.type === 'level' ? 'New level' : 'PR'}">${ev.type === 'level' ? '▲' : '★'}</span>
+          <span class="pr-star ${ev.type === 'level' ? 'lvl' : ''}" title="${ev.type === 'level' ? 'New progression' : 'PR'}">${ev.type === 'level' ? '▲' : '★'}</span>
           <span class="pr-name"><b>${esc(ev.ex.name)}</b> <span class="muted">${esc(ev.entry.levelName)}</span></span>
           <span class="pr-num">${esc(fmtVal(ev.ex, ev.entry.value))}</span>
           <span class="small muted pr-date">${fmtShort(ev.entry.date)}</span>
@@ -598,14 +732,14 @@ function prRowCompact(ex, pr) {
 
 function prRow(ex, e) {
   return `<li>
-    <span>${esc(e.levelName)} ${tempoTag(e)}<br><span class="small muted">${fmtDay(e.date)}${e.manual ? ' · manual' : ''}${e.note ? ` · ${esc(e.note)}` : ''}</span></span>
+    <span>${esc(e.levelName)} ${tempoTag(e)}${clusterTag(e)}<br><span class="small muted">${fmtDay(e.date)}${e.manual ? ' · manual' : ''}${e.note ? ` · ${esc(e.note)}` : ''}</span></span>
     <span class="row" style="justify-content:flex-end">${loadInline(e)}<span class="pl-v">${esc(fmtVal(ex, e.value))}</span></span>
     ${e.manual ? `<button class="icon-btn plain" data-act="pr-del" data-id="${e.id}" aria-label="Delete manual PR">×</button>` : '<span></span>'}
   </li>`;
 }
 
 function prLevelOptions(ex, selected = ex.currentLevel) {
-  return ex.levels.map((name, i) => `<option value="${i}" ${i === selected ? 'selected' : ''}>L${i + 1} · ${esc(name)}</option>`).join('');
+  return ex.levels.map((name, i) => `<option value="${i}" ${i === selected ? 'selected' : ''}>${esc(name)}</option>`).join('');
 }
 
 function sheetAddPR(exId) {
@@ -635,14 +769,12 @@ function sheetAddPR(exId) {
         <label class="field"><span>Date</span>
           <input class="input" name="date" type="date" value="${dayKey(Date.now())}" max="${dayKey(Date.now())}" required></label>
       </div>
-      <div class="grid2" data-pr-bands ${ex.allowBands === false ? 'hidden' : ''}>
+      <div data-pr-bands ${ex.allowBands === false ? 'hidden' : ''}>
         <label class="field"><span>Band</span>
           <select class="input" name="band">
             <option value="">No band</option>
             ${bands.map((b) => `<option value="${b.id}">${esc(b.name)} · ${esc(b.widthMm)} mm</option>`).join('')}
           </select></label>
-        <label class="field"><span>Band mode</span>
-          <select class="input" name="bandMode"><option value="assist">Assist</option><option value="resist">Resist</option></select></label>
       </div>
       <label class="field" data-pr-tempo ${ex.kind === 'reps' ? '' : 'hidden'}><span>Tempo</span>
         <select class="input" name="tempo">
@@ -682,7 +814,6 @@ function viewBands() {
 
 // ---------- History ----------
 function sessionCard(s, compact = false, groups = null) {
-  const open = ui.openSessions.has(s.id);
   const byEx = s.exerciseIds.length ? s.exerciseIds : [...new Set(s.sets.map((x) => x.exId))];
   const lines = byEx.map((id) => {
     const ex = S.exById(id);
@@ -693,17 +824,16 @@ function sessionCard(s, compact = false, groups = null) {
     const vals = sets.map((x) => esc(fmtVal(ex, x.value))).join(' / ');
     return `<div style="padding:7px 0;border-top:1px solid var(--line)">
       <div class="spread"><b>${esc(ex.name)}</b><span class="num">${vals}</span></div>
-      <div class="small muted">L${top.level + 1} · ${esc(top.levelName)}</div>
+      <div class="small muted">${esc(top.levelName)}</div>
     </div>`;
   }).join('');
   return `
-    <div class="card">
-      <div class="spread" ${compact ? '' : `data-act="toggle-session" data-id="${s.id}" style="cursor:pointer"`}>
+    <div class="card tap" data-act="open-session" data-id="${s.id}">
+      <div class="spread">
         <b>${fmtDate(s.startedAt)}</b>
-        <span class="small muted">${s.sets.length} set${s.sets.length === 1 ? '' : 's'}${s.endedAt ? ` · ${fmtDur(s.endedAt - s.startedAt)}` : ' · in progress'}</span>
+        <span class="small muted">${s.sets.length} set${s.sets.length === 1 ? '' : 's'}${s.endedAt ? ` · ${fmtDur(s.endedAt - s.startedAt)}` : ' · in progress'} ›</span>
       </div>
       <div style="margin-top:8px">${lines}</div>
-      ${open && !compact ? `<button class="btn danger sm" style="margin-top:8px" data-act="del-session" data-id="${s.id}">Delete session</button>` : ''}
     </div>`;
 }
 
@@ -792,6 +922,202 @@ function viewHistory() {
 `;
 }
 
+// ---------- Edit a logged set (long-press) ----------
+function sheetSetEdit(key) {
+  const [sessionId, setId] = String(key).split('|');
+  const sess = state.sessions.find((x) => x.id === sessionId);
+  const set = sess?.sets.find((x) => x.id === setId);
+  const ex = set && S.exById(set.exId);
+  if (!ex) return '';
+  const n = sess.sets.filter((x) => x.exId === ex.id).indexOf(set) + 1;
+  const bands = [...state.bands].sort((a, b) => (a.widthMm || 0) - (b.widthMm || 0));
+  const unitWord = ex.kind === 'static' ? 'Seconds' : 'Reps';
+  return `
+    <div class="sheet-head">
+      <div><h2>${esc(ex.name)}</h2><div class="small muted">Set ${n} · ${esc(fmtDate(sess.startedAt))}</div></div>
+      <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
+    </div>
+    <form class="stack" id="set-form" data-session="${sessionId}" data-set="${setId}">
+      <div class="field"><span>${unitWord}</span>
+        <div class="counter">
+          <button type="button" data-act="pf-adj" data-d="-1" aria-label="Less">−</button>
+          <input class="num" type="number" inputmode="numeric" min="0" name="value" value="${esc(set.value)}" aria-label="${unitWord}">
+          <button type="button" data-act="pf-adj" data-d="1" aria-label="More">+</button>
+        </div>
+      </div>
+      ${set.cluster ? `<p class="small muted" style="margin:0">Cluster ${set.cluster.join(' + ')}. Changing the total makes it a normal set.</p>` : ''}
+      <label class="field"><span>Progression level</span>
+        <select class="input" name="level">${ex.levels.map((name, i) => `<option value="${i}" ${i === set.level ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></label>
+      ${ex.allowBands !== false || set.bands.length ? `
+        <div class="field"><span>Resistance band</span>
+          <div class="band-checks">${bands.map((b) => `
+            <label class="band-check"><input type="checkbox" name="band" value="${b.id}" ${set.bands.includes(b.id) ? 'checked' : ''}>${swatch(b)}<span>${esc(b.name)}</span></label>`).join('')}
+          </div></div>` : ''}
+      ${ex.allowWeight !== false || set.addedKg ? `
+        <label class="weight-row"><span class="label">Added weight</span>
+          <span class="kg-input"><input class="input num" type="number" name="addedKg" min="0" step="0.5" inputmode="decimal" value="${esc(set.addedKg || '')}" placeholder="0"><span class="muted">kg</span></span></label>` : ''}
+      ${ex.kind === 'reps' ? `
+        <label class="field"><span>Tempo</span>
+          <select class="input" name="tempo"><option value="">Standard</option>
+            ${Object.entries(TEMPOS).map(([k, label]) => `<option value="${k}" ${set.tempo === k ? 'selected' : ''}>${label}</option>`).join('')}
+          </select></label>` : ''}
+      <div class="grid2">
+        <button class="btn danger big" type="button" data-act="set-edit-delete" data-session="${sessionId}" data-set="${setId}">Delete set</button>
+        <button class="btn primary big" type="submit">Save</button>
+      </div>
+    </form>`;
+}
+
+// ---------- Sets × reps popup ----------
+/** Starting values: the current plan, else the one used last session, else 3 × goal. */
+function planDefaults(ex) {
+  const p = planOf(ex.id) || parsePlan(
+    [...state.sessions].sort((a, b) => b.startedAt - a.startedAt)
+      .find((x) => x.id !== state.activeSessionId && x.plans?.[ex.id])?.plans[ex.id]);
+  if (p) return { sets: p.sets, value: p.cluster ? p.perSet : p.parts[0], cluster: p.cluster, parts: p.cluster ? p.parts.join('+') : '', rest: p.clusterRest || 15 };
+  const value = ex.kind === 'static' ? Math.min(ex.goal, 30) : Math.min(ex.goal, 10);
+  return { sets: 3, value, cluster: false, parts: '', rest: 15 };
+}
+
+function sheetPlan(exId) {
+  const ex = S.exById(exId);
+  if (!ex) return '';
+  const v = planDefaults(ex);
+  const unitWord = ex.kind === 'static' ? 'Seconds' : 'Reps';
+  const stepper = (field, value, label) => `
+    <div class="field"><span>${label}</span>
+      <div class="counter">
+        <button type="button" data-act="pf-adj" data-f="${field}" data-d="-1" aria-label="Fewer ${label.toLowerCase()}">−</button>
+        <input class="num" type="number" inputmode="numeric" min="1" name="${field}" value="${value}" aria-label="${label}">
+        <button type="button" data-act="pf-adj" data-f="${field}" data-d="1" aria-label="More ${label.toLowerCase()}">+</button>
+      </div>
+    </div>`;
+  const d = draftFor(ex.id);
+  const sess = S.activeSession();
+  const prev = S.lastSetsFor(ex.id, sess?.id);
+  const bands = [...state.bands].sort((a, b) => (a.widthMm || 0) - (b.widthMm || 0));
+  return `
+    <div class="sheet-head">
+      <h2>${esc(ex.name)}</h2>
+      <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
+    </div>
+    ${prev ? `<div class="hint last-hint">${lastSessionLine(ex, prev)}</div>` : `<p class="small muted" style="margin:0 0 10px">First time logging ${esc(ex.name)}.</p>`}
+    <form class="stack" id="plan-form" data-id="${ex.id}">
+      <label class="field"><span>Progression level</span>
+        <select class="input level-select" name="level">${ex.levels.map((name, i) => `<option value="${i}" ${i === d.level ? 'selected' : ''}>${esc(name)}</option>`).join('')}</select></label>
+      <div class="grid2">${stepper('sets', v.sets, 'Sets')}${stepper('value', v.value, unitWord)}</div>
+      <label class="toggle"><input type="checkbox" name="cluster" ${v.cluster ? 'checked' : ''} data-pf-cluster><span>Cluster set</span></label>
+      <div class="grid2" data-pf-cluster-fields ${v.cluster ? '' : 'hidden'}>
+        <label class="field"><span>Split each set</span>
+          <input class="input num" name="parts" value="${esc(v.parts)}" placeholder="${ex.kind === 'static' ? '5+5+5' : '4+3+3'}" inputmode="text" autocomplete="off"></label>
+        <label class="field"><span>Rest between (s)</span>
+          <input class="input num" name="rest" type="number" min="0" step="5" inputmode="numeric" value="${v.rest}"></label>
+      </div>
+      ${ex.allowBands !== false ? `
+        <div class="field"><span>Resistance band</span>
+          <div class="band-checks">${bands.map((b) => `
+            <label class="band-check"><input type="checkbox" name="band" value="${b.id}" ${d.bands.includes(b.id) ? 'checked' : ''}>${swatch(b)}<span>${esc(b.name)}</span></label>`).join('')}
+          </div></div>` : ''}
+      ${ex.allowWeight !== false ? `
+        <label class="weight-row"><span class="label">Added weight</span>
+          <span class="kg-input"><input class="input num" type="number" name="addedKg" min="0" step="0.5" inputmode="decimal" value="${esc(d.addedKg || '')}" placeholder="0"><span class="muted">kg</span></span></label>` : ''}
+      ${ex.kind === 'reps' ? `
+        <div class="field"><span>Tempo</span>
+          <div class="seg seg-radio" role="radiogroup" aria-label="Tempo">
+            <label><input type="radio" name="tempo" value="" ${!d.tempo ? 'checked' : ''}>Standard</label>
+            ${Object.entries(TEMPOS).map(([k, label]) => `<label><input type="radio" name="tempo" value="${k}" ${d.tempo === k ? 'checked' : ''}>${label}</label>`).join('')}
+          </div></div>` : ''}
+      <div class="field"><span>Equipment</span>
+        <div class="seg seg-radio" role="radiogroup" aria-label="Equipment">
+          ${Object.entries(EQUIPMENT).map(([k, label]) => `<label><input type="radio" name="equipment" value="${k}" ${(ex.equipment || 'none') === k ? 'checked' : ''}>${label}</label>`).join('')}
+        </div></div>
+      <div class="grid2">
+        <button class="btn ghost big" type="button" data-act="plan-clear" data-id="${ex.id}">No plan</button>
+        <button class="btn primary big" type="submit">Save</button>
+      </div>
+    </form>`;
+}
+
+// ---------- Saved workout editor ----------
+const workoutText = (items) => items.map((it) => {
+  const ex = S.exById(it.exId);
+  if (!ex) return '';
+  const p = parsePlan(it.plan);
+  return `${ex.name}${it.plan ? ` ${p ? formatPlan(p, ex.kind) : it.plan}` : ''}`;
+}).filter(Boolean).join('\n');
+
+function sheetWorkout(id) {
+  const w = id && id !== 'new' && id !== 'session' ? state.workouts.find((x) => x.id === id) : null;
+  const text = w ? workoutText(w.items) : id === 'session' ? workoutText(S.sessionAsItems()) : '';
+  return `
+    <div class="sheet-head">
+      <h2>${w ? 'Edit workout' : 'New workout'}</h2>
+      <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
+    </div>
+    <form class="stack" id="wk-form" data-id="${w ? w.id : ''}">
+      <label class="field"><span>Name</span>
+        <input class="input" name="name" required value="${esc(w?.name || '')}" placeholder="e.g. Pull day"></label>
+      <label class="field"><span>One exercise per line, with sets x reps</span>
+        <textarea class="input wk-text" name="text" data-wk-text spellcheck="false" autocapitalize="off"
+          placeholder="Pull-up 3x8&#10;Front lever 4x10s&#10;Dip 3x(4+3+3)">${esc(text)}</textarea></label>
+      <p class="small muted" style="margin:0">Holds are in seconds. Clusters: <code>3x(4+3+3)</code>, with a custom rest <code>3x(4+3+3)/20s</code>.</p>
+      <ul class="wk-preview" data-wk-preview></ul>
+      <div class="grid2">
+        <button class="btn primary big" type="submit" name="go" value="save">Save</button>
+        <button class="btn big" type="submit" name="go" value="start">${S.activeSession() ? 'Save & add' : 'Save & start'}</button>
+      </div>
+      ${w ? `<button class="btn danger block" type="button" data-act="wk-delete" data-id="${w.id}">Delete workout</button>` : ''}
+    </form>`;
+}
+
+function updateWorkoutPreview() {
+  const ta = document.querySelector('[data-wk-text]');
+  const ul = document.querySelector('[data-wk-preview]');
+  if (!ta || !ul) return;
+  const rows = parseWorkoutText(ta.value, state.exercises.filter((e) => !e.archived));
+  ul.innerHTML = rows.map((r) => r.error
+    ? `<li class="bad">⚠ ${esc(r.error)}</li>`
+    : `<li><span>${esc(r.ex.name)}</span><b>${r.plan ? esc(formatPlan(r.plan, r.ex.kind)) : '<span class="muted">no plan</span>'}</b></li>`).join('');
+}
+
+/** Add a saved workout's exercises (and plans) to the running session. */
+function addWorkoutToSession(w) {
+  const s = S.activeSession();
+  for (const it of w.items) {
+    if (!S.exById(it.exId)) continue;
+    S.addExerciseToSession(it.exId);
+    if (it.plan && !S.planFor(it.exId)) S.setPlan(it.exId, it.plan);
+    delete ui.drafts[it.exId];
+  }
+  return s;
+}
+
+// ---------- Session details ----------
+function sheetSession(s) {
+  const exIds = [...new Set([...s.exerciseIds, ...s.sets.map((x) => x.exId)])];
+  const fmtTime = (ts) => new Date(ts).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const blocks = exIds.map((id) => {
+    const ex = S.exById(id);
+    const sets = s.sets.filter((x) => x.exId === id);
+    if (!ex || !sets.length) return '';
+    const prIds = new Set(S.prsFor(ex.id).events.map((ev) => ev.entry.id));
+    return `
+      <div class="card">
+        <div class="spread"><h3>${esc(ex.name)}</h3><span class="small muted">${sets.length} set${sets.length === 1 ? '' : 's'}</span></div>
+        <ul class="sets">${sets.map((x, i) => setRow(ex, x, s.id, i + 1, prIds)).join('')}</ul>
+      </div>`;
+  }).join('');
+  return `
+    <div class="sheet-head">
+      <h2>${fmtDate(s.startedAt)}</h2>
+      <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
+    </div>
+    <p class="small muted" style="margin-top:0">${fmtTime(s.startedAt)}${s.endedAt ? `–${fmtTime(s.endedAt)} · ${fmtDur(s.endedAt - s.startedAt)}` : ' · in progress'}
+      · ${s.sets.length} set${s.sets.length === 1 ? '' : 's'}. Swipe a set left to delete it.</p>
+    ${blocks || '<div class="empty small">No sets in this session.</div>'}
+    <button class="btn danger block" style="margin-top:14px" data-act="del-session" data-id="${s.id}">Delete session</button>`;
+}
+
 // ---------- Settings (Skills, Bands, Data) ----------
 function viewSettings() {
   const t = ui.settingsTab;
@@ -809,8 +1135,9 @@ function viewData() {
   return `
     <h2>Rest timer & backup</h2>
     <div class="card stack">
-      <label class="field"><span>Rest timer after each set (seconds, 0 = off)</span>
-        <input class="input num" type="number" min="0" step="15" inputmode="numeric" value="${esc(state.restSeconds ?? 90)}" data-setting="restSeconds"></label>
+      <label class="toggle"><input type="checkbox" data-setting="restOn" ${state.restOn !== false ? 'checked' : ''}><span>Rest timer after each set</span></label>
+      <label class="field" ${state.restOn === false ? 'hidden' : ''}><span>Rest time (seconds)</span>
+        <input class="input num" type="number" min="5" step="15" inputmode="numeric" value="${esc(state.restSeconds ?? 90)}" data-setting="restSeconds"></label>
       <div class="grid2">
         <button class="btn" data-act="export">Export JSON</button>
         <label class="btn" style="cursor:pointer">Import JSON<input type="file" accept="application/json,.json" hidden data-import></label>
@@ -830,11 +1157,25 @@ function renderSheet() {
   if (type === 'edit') body = sheetEditor(id === 'new' ? null : S.exById(id));
   if (type === 'picker') body = sheetPicker();
   if (type === 'pr-add') body = sheetAddPR(id);
+  if (type === 'workout') body = sheetWorkout(id);
+  if (type === 'plan') body = sheetPlan(id);
+  if (type === 'setedit') body = sheetSetEdit(id) || (ui.sheet = null, '');
+  if (type === 'exdetail') {
+    const sess = S.activeSession(), ex = S.exById(id);
+    if (!sess || !ex || !sess.exerciseIds.includes(id)) { ui.sheet = null; return renderSheet(); }
+    body = exDetail(ex, sess);
+  }
+  if (type === 'session') {
+    const sess = state.sessions.find((x) => x.id === id);
+    if (!sess) { ui.sheet = null; return renderSheet(); }
+    body = sheetSession(sess);
+  }
   const scroll = wrap.querySelector('.sheet')?.scrollTop || 0;
   wrap.innerHTML = `<div class="sheet" role="dialog" aria-modal="true"><div class="sheet-grip"></div>${body}</div>`;
   wrap.hidden = false;
   wrap.querySelector('.sheet').scrollTop = scroll;
   if (type === 'picker') applyPickerFilter();
+  if (type === 'workout') updateWorkoutPreview();
 }
 
 function openSheet(type, id) { ui.sheet = { type, id }; renderSheet(); }
@@ -854,15 +1195,22 @@ const COUNTDOWN = 3;
 
 function startTimer(exId) {
   beep(660, 0.05); // also unlocks audio on iOS within the user gesture
-  ui.timer = { exId, phase: 'ready', t0: performance.now() + COUNTDOWN * 1000, start: 0, elapsed: 0, hit: false };
+  const p = planOf(exId);
+  ui.timer = { exId, phase: 'ready', t0: performance.now() + COUNTDOWN * 1000, start: 0, elapsed: 0, hit: false,
+    goal: p && !p.cluster ? p.perSet : S.exById(exId).goal };
   holdWake(true);
   renderTimer();
   tick();
 }
 
 function tick() {
+  if (holdCheck()) ui.timer.raf = requestAnimationFrame(tick);
+}
+
+/** Advance the hold timer; returns false once there's nothing left to animate. */
+function holdCheck() {
   const t = ui.timer;
-  if (!t || t.phase === 'done') return;
+  if (!t || t.phase === 'done') return false;
   const now = performance.now();
   const ex = S.exById(t.exId);
   if (t.phase === 'ready' && now >= t.t0) {
@@ -871,10 +1219,10 @@ function tick() {
   }
   if (t.phase === 'hold') {
     t.elapsed = (now - t.start) / 1000;
-    if (!t.hit && t.elapsed >= ex.goal) { t.hit = true; beep(1320, 0.12, 2); $('#timer').classList.add('hit'); }
+    if (!t.hit && t.elapsed >= t.goal) { t.hit = true; beep(1320, 0.12, 2); $('#timer').classList.add('hit'); }
   }
   updateTimerDigits();
-  t.raf = requestAnimationFrame(tick);
+  return true;
 }
 
 function updateTimerDigits() {
@@ -885,7 +1233,7 @@ function updateTimerDigits() {
   else if (t.phase === 'hold') {
     el.textContent = t.elapsed < 60 ? t.elapsed.toFixed(1) : fmtClock(t.elapsed);
     const bar = $('#timer .goalbar > b');
-    if (bar) bar.style.width = `${Math.min(100, (t.elapsed / ex.goal) * 100)}%`;
+    if (bar) bar.style.width = `${Math.min(100, (t.elapsed / t.goal) * 100)}%`;
   }
 }
 
@@ -915,7 +1263,7 @@ function renderTimer() {
       </div>`;
   } else {
     el.innerHTML = `${head}
-      <div class="t-phase">${t.phase === 'ready' ? 'Get into position' : `Hold · goal ${ex.goal}s`}</div>
+      <div class="t-phase">${t.phase === 'ready' ? 'Get into position' : `Hold · goal ${t.goal}s`}</div>
       <div class="t-digits">${t.phase === 'ready' ? COUNTDOWN : '0.0'}</div>
       <div class="goalbar t-goal"><b style="width:0"></b></div>
       <div class="tap-zone">
@@ -944,29 +1292,169 @@ function closeTimer() {
   renderTimer();
 }
 
+// ================= CLUSTER TIMER =================
+// Runs a cluster set part by part: work (hold, or reps tapped "done"), short rest, next part.
+function startCluster(exId) {
+  const ex = S.exById(exId), p = planOf(exId);
+  if (!p?.cluster) return;
+  beep(660, 0.05);
+  ui.cluster = {
+    exId, parts: p.parts, rest: p.clusterRest, idx: 0, results: [],
+    hold: ex.kind === 'static', count: p.parts[0],
+    phase: ex.kind === 'static' ? 'ready' : 'work', t0: performance.now() + COUNTDOWN * 1000, start: 0, hit: false,
+  };
+  holdWake(true);
+  renderCluster();
+  clusterTick();
+}
+
+function clusterNext() {
+  const c = ui.cluster;
+  if (c.idx >= c.parts.length - 1) { c.phase = 'done'; holdWake(false); beep(1320, 0.12, 2); renderCluster(); return; }
+  c.phase = 'rest'; c.t0 = performance.now() + c.rest * 1000; c.beeped = new Set();
+  renderCluster();
+}
+
+/** Countdown or rest is over: start the next work part. */
+function clusterBeginPart() {
+  const c = ui.cluster;
+  if (c.phase === 'rest') { c.idx++; c.count = c.parts[c.idx]; }
+  c.phase = 'work'; c.start = performance.now(); c.hit = false; beep(990, 0.18);
+  renderCluster();
+}
+
+function clusterTick() {
+  if (clusterCheck()) ui.cluster.raf = requestAnimationFrame(clusterTick);
+}
+
+/** Advance the cluster timer; returns false once there's nothing left to animate. */
+function clusterCheck() {
+  const c = ui.cluster;
+  if (!c || c.phase === 'done') return false;
+  const now = performance.now();
+  if ((c.phase === 'ready' || c.phase === 'rest') && now >= c.t0) clusterBeginPart();
+  const el = $('#timer .t-digits');
+  if (el) {
+    if (c.phase === 'ready') el.textContent = Math.ceil((c.t0 - now) / 1000);
+    else if (c.phase === 'rest') {
+      const left = Math.ceil((c.t0 - now) / 1000);
+      el.textContent = left;
+      if (left <= 3 && left > 0 && !c.beeped.has(left)) { c.beeped.add(left); beep(660, 0.06); }
+    } else if (c.phase === 'work' && c.hold) {
+      const t = (now - c.start) / 1000;
+      el.textContent = t.toFixed(1);
+      if (!c.hit && t >= c.parts[c.idx]) { c.hit = true; beep(1320, 0.12, 2); el.classList.add('hit'); }
+    }
+  }
+  return true;
+}
+
+function renderCluster() {
+  const el = $('#timer');
+  const c = ui.cluster;
+  if (!c) { el.hidden = true; el.innerHTML = ''; el.className = 'timer'; return; }
+  const ex = S.exById(c.exId), d = draftFor(c.exId);
+  const u = c.hold ? 's' : '';
+  const steps = c.parts.map((n, i) => `<span class="cl-step ${i < c.results.length ? 'done' : i === c.idx && c.phase !== 'done' ? 'cur' : ''}">${i < c.results.length ? c.results[i] : n}${u}</span>`).join('<span class="muted">+</span>');
+  const head = `<div class="t-ex">${esc(ex.name)}</div>
+    <div class="row">${esc(ex.levels[d.level])} · cluster</div>
+    <div class="cl-steps">${steps}</div>`;
+  let body = '';
+  if (c.phase === 'ready') {
+    body = `<div class="t-phase">Get into position</div><div class="t-digits">${COUNTDOWN}</div>
+      <div class="t-actions"><button class="btn ghost big" data-act="cl-cancel">Cancel</button></div>`;
+  } else if (c.phase === 'work' && c.hold) {
+    body = `<div class="t-phase">Part ${c.idx + 1} of ${c.parts.length} · hold ${c.parts[c.idx]}s</div><div class="t-digits">0.0</div>
+      <div class="tap-zone"><button class="btn primary big block" style="min-height:96px;font-size:24px" data-act="cl-stop">STOP</button></div>
+      <button class="btn ghost sm" data-act="cl-cancel">Cancel cluster</button>`;
+  } else if (c.phase === 'work') {
+    body = `<div class="t-phase">Part ${c.idx + 1} of ${c.parts.length}</div>
+      <div class="t-digits">${c.count}<span style="font-size:.3em"> reps</span></div>
+      <div class="counter" style="width:min(86vw,380px)">
+        <button data-act="cl-adj" data-d="-1" aria-label="One rep less">−</button><div class="small muted">reps done</div>
+        <button data-act="cl-adj" data-d="1" aria-label="One rep more">+</button>
+      </div>
+      <div class="tap-zone"><button class="btn primary big block" style="min-height:80px;font-size:22px" data-act="cl-done">Done</button></div>
+      <button class="btn ghost sm" data-act="cl-cancel">Cancel cluster</button>`;
+  } else if (c.phase === 'rest') {
+    body = `<div class="t-phase">Rest · next ${c.parts[c.idx + 1]}${u}</div><div class="t-digits">${c.rest}</div>
+      <div class="t-actions"><button class="btn ghost big" data-act="cl-skip">Skip rest</button></div>`;
+  } else {
+    const total = c.results.reduce((a, b) => a + b, 0);
+    body = `<div class="t-phase">Cluster done</div>
+      <div class="t-digits">${total}<span style="font-size:.3em">${c.hold ? 's' : ' reps'}</span></div>
+      <div class="small muted">${c.results.join(' + ')}${u}</div>
+      <div class="t-actions">
+        <button class="btn ghost big" data-act="cl-discard">Discard</button>
+        <button class="btn primary big" data-act="cl-log">Log set</button>
+      </div>`;
+  }
+  el.className = `timer ${c.phase === 'ready' ? 'ready' : ''} ${c.phase === 'rest' ? 'resting' : ''}`;
+  el.innerHTML = head + body;
+  el.hidden = false;
+}
+
+function closeCluster() {
+  if (ui.cluster) cancelAnimationFrame(ui.cluster.raf);
+  ui.cluster = null;
+  holdWake(false);
+  renderCluster();
+}
+
 // ================= REST TIMER =================
 function startRest() {
   const secs = Number(state.restSeconds ?? 90);
-  if (!secs) return;
-  ui.rest = { end: Date.now() + secs * 1000, done: false };
+  if (state.restOn === false || !secs) return;
+  ui.rest = { end: Date.now() + secs * 1000, done: false, paused: false, left: secs };
   renderRest();
+  if (ui.tab === 'workout') render();
 }
+const restLeft = (r) => (r.paused ? r.left : (r.end - Date.now()) / 1000);
 function renderRest() {
   const el = $('#rest');
   const r = ui.rest;
   if (!r) { el.hidden = true; return; }
-  const left = (r.end - Date.now()) / 1000;
-  if (left <= 0 && !r.done) {
+  const left = restLeft(r);
+  if (left <= 0 && !r.done && !r.paused) {
     r.done = true; beep(880, 0.15, 3);
-    setTimeout(() => { if (ui.rest === r) { ui.rest = null; renderRest(); } }, 8000);
+    setTimeout(() => { if (ui.rest === r) { ui.rest = null; renderRest(); if (ui.tab === 'workout') render(); } }, 8000);
   }
-  el.className = `rest ${r.done ? 'done' : ''}`;
-  el.innerHTML = `<span class="r-l">${r.done ? 'Go' : 'Rest'}</span><span class="r-t">${r.done ? '0:00' : fmtClock(Math.ceil(left))}</span>
-    ${r.done ? '' : '<button data-act="rest-add">+15</button>'}<button data-act="rest-close" aria-label="Close rest timer">×</button>`;
+  el.className = `rest ${r.done ? 'done' : ''} ${r.paused ? 'paused' : ''}`;
+  el.innerHTML = `<span class="r-l">${r.done ? 'Go' : r.paused ? 'Paused' : 'Rest'}</span>
+    <span class="r-t">${r.done ? '0:00' : fmtClock(Math.ceil(left))}</span>
+    ${r.done ? '' : `<button data-act="rest-pause" aria-label="${r.paused ? 'Resume' : 'Pause'} rest timer">${r.paused ? '▶' : '❚❚'}</button>`}
+    <button data-act="rest-close" aria-label="Close rest timer">×</button>`;
   el.hidden = false;
 }
 
 // ================= ACTIONS =================
+/** Save the setup popup's progression, band, weight, tempo and equipment choices. */
+function applySetup(f, ex) {
+  const d = draftFor(ex.id);
+  if (f.level) {
+    const lvl = clamp(Number(f.level.value) || 0, 0, ex.levels.length - 1);
+    d.level = lvl; ex.currentLevel = lvl;
+  }
+  d.bands = [...f.querySelectorAll('input[name="band"]:checked')].map((x) => x.value);
+  d.bandMode = 'assist';
+  if (f.addedKg) d.addedKg = Math.max(0, Number(f.addedKg.value) || 0);
+  const tempo = f.querySelector('input[name="tempo"]:checked');
+  if (tempo) d.tempo = tempo.value || null;
+  const eq = f.querySelector('input[name="equipment"]:checked');
+  if (eq && EQUIPMENT[eq.value]) ex.equipment = eq.value;
+  S.save();
+}
+
+/** Circle tapped: holds/clusters open their timer, reps log the target right away. */
+function completeSet(exId) {
+  const ex = S.exById(exId), d = draftFor(exId), p = planOf(exId);
+  if (p?.cluster) { startCluster(exId); return; }
+  if (ex.kind === 'static') { startTimer(exId); return; }
+  const value = p ? p.perSet : Number(d.value) || 1;
+  logAndCelebrate(exId, { ...d, value });
+  render();
+}
+
 function logAndCelebrate(exId, draft) {
   const set = S.logSet(exId, draft);
   startRest();
@@ -974,20 +1462,20 @@ function logAndCelebrate(exId, draft) {
   if (ev) {
     const ex = S.exById(exId);
     toast(ev.type === 'level'
-      ? `★ New level · ${ex.name}: ${set.levelName}`
-      : `★ New PR · ${ex.name} L${set.level + 1}${set.tempo ? ` ${TEMPOS[set.tempo].toLowerCase()}` : ''}: ${fmtVal(ex, set.value)}`);
+      ? `★ New progression · ${ex.name}: ${set.levelName}`
+      : `★ New PR · ${ex.name}${set.tempo ? ` ${TEMPOS[set.tempo].toLowerCase()}` : ''}: ${fmtVal(ex, set.value)}`);
     beep(1320, 0.1, 2);
   }
 }
 
 let toastTimer = null;
-function toast(msg) {
+function toast(msg, action) {
   const el = $('#toast');
-  el.textContent = msg;
+  el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button data-act="${action.act}">${esc(action.label)}</button>` : ''}`;
   el.hidden = false;
   el.style.animation = 'none'; void el.offsetWidth; el.style.animation = '';
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, 3500);
+  toastTimer = setTimeout(() => { el.hidden = true; }, action ? 6000 : 3500);
 }
 
 function toggleGroup(set, g) {
@@ -1022,13 +1510,17 @@ const actions = {
   },
   'pick-ex': (el) => {
     if (!S.activeSession()) S.startSession();
-    S.addExerciseToSession(el.dataset.id); closeSheet(); ui.tab = 'workout'; render();
+    S.addExerciseToSession(el.dataset.id); ui.exCollapsed.delete(el.dataset.id); ui.tab = 'workout';
+    render();
+    openSheet('plan', el.dataset.id);
   },
   'remove-ex': (el) => {
     const s = S.activeSession();
     const n = s?.sets.filter((x) => x.exId === el.dataset.id).length || 0;
     if (n && !confirm(`Remove this exercise and its ${n} logged set(s)?`)) return;
-    S.removeExerciseFromSession(el.dataset.id); delete ui.drafts[el.dataset.id]; render();
+    S.removeExerciseFromSession(el.dataset.id); delete ui.drafts[el.dataset.id];
+    if (ui.sheet?.type === 'exdetail') ui.sheet = null;
+    render();
   },
   lvl: (el) => {
     const ex = S.exById(el.dataset.id), d = draftFor(ex.id);
@@ -1054,7 +1546,10 @@ const actions = {
   log: (el) => {
     const ex = S.exById(el.dataset.id), d = draftFor(ex.id);
     if (!(Number(d.value) > 0)) { alert(`Enter ${ex.kind === 'static' ? 'hold seconds' : 'reps'} first.`); return; }
-    logAndCelebrate(ex.id, d); render();
+    const p = planOf(ex.id);
+    const asCluster = p?.cluster && Number(d.value) === p.perSet;
+    logAndCelebrate(ex.id, asCluster ? { ...d, cluster: p.parts, clusterRest: p.clusterRest } : d);
+    render();
   },
   'del-set': (el) => { S.deleteSet(el.dataset.session, el.dataset.set); render(); },
   'open-ex': (el) => openSheet('ex', el.dataset.id),
@@ -1104,12 +1599,81 @@ const actions = {
   'cal-group': (el) => { toggleGroup(ui.calGroups, el.dataset.g); ui.calDay = null; render(); },
   'pr-group': (el) => { toggleGroup(ui.prGroups, el.dataset.g); render(); },
   'cal-day': (el) => { ui.calDay = el.dataset.day && el.dataset.day !== ui.calDay ? el.dataset.day : null; render(); },
+  'open-session': (el) => openSheet('session', el.dataset.id),
+  cluster: (el) => startCluster(el.dataset.id),
+  'cl-cancel': () => closeCluster(),
+  'cl-discard': () => closeCluster(),
+  'cl-stop': () => {
+    const c = ui.cluster;
+    c.results.push(Math.max(0, Math.round((performance.now() - c.start) / 1000)));
+    clusterNext();
+  },
+  'cl-adj': (el) => { const c = ui.cluster; c.count = Math.max(0, c.count + Number(el.dataset.d)); renderCluster(); },
+  'cl-done': () => { const c = ui.cluster; c.results.push(c.count); clusterNext(); },
+  'cl-skip': () => { if (ui.cluster?.phase === 'rest') clusterBeginPart(); },
+  'cl-log': () => {
+    const c = ui.cluster, d = draftFor(c.exId);
+    const total = c.results.reduce((a, b) => a + b, 0);
+    const exId = c.exId, parts = [...c.results], rest = c.rest;
+    closeCluster();
+    if (total > 0) logAndCelebrate(exId, { ...d, value: total, cluster: parts, clusterRest: rest });
+    render();
+  },
+  'plan-edit': (el) => {
+    // Coming from the details sheet, go back there after saving.
+    ui.sheetReturn = ui.sheet?.type === 'exdetail' ? { ...ui.sheet } : null;
+    openSheet('plan', el.dataset.id);
+  },
+  'ex-detail': (el) => openSheet('exdetail', el.dataset.id),
+  'set-do': (el) => completeSet(el.dataset.id),
+  'set-add': (el) => completeSet(el.dataset.id),
+  'set-edit': (el) => {
+    ui.sheetReturn = ui.sheet ? { ...ui.sheet } : null;
+    openSheet('setedit', `${el.dataset.session}|${el.dataset.set}`);
+  },
+  'plan-clear': (el) => {
+    const f = el.closest('form'), ex = S.exById(el.dataset.id);
+    if (f && ex) applySetup(f, ex);
+    S.setPlan(el.dataset.id, ''); ui.sheet = ui.sheetReturn; ui.sheetReturn = null; render();
+  },
+  'pf-adj': (el) => {
+    const input = el.closest('.counter').querySelector('input');
+    const min = Number(input.min || 1);
+    input.value = Math.max(min, (Number(input.value) || 0) + Number(el.dataset.d));
+  },
+  'set-edit-delete': (el) => {
+    const removed = S.deleteSet(el.dataset.session, el.dataset.set);
+    if (removed) { ui.lastDeleted = removed; toast('Set deleted', { act: 'undo-delete', label: 'Undo' }); }
+    ui.sheet = ui.sheetReturn; ui.sheetReturn = null;
+    render();
+  },
+  'wk-edit': (el) => openSheet('workout', el.dataset.id),
+  'wk-from-session': () => openSheet('workout', 'session'),
+  'wk-delete': (el) => {
+    if (!confirm('Delete this saved workout? Your logged sessions are not affected.')) return;
+    S.deleteWorkout(el.dataset.id); ui.sheet = null; render();
+  },
+  'wk-start': (el) => {
+    const w = state.workouts.find((x) => x.id === el.dataset.id);
+    if (!w) return;
+    if (S.activeSession()) addWorkoutToSession(w);
+    else { S.startFromWorkout(w.id); ui.drafts = {}; }
+    ui.tab = 'workout'; ui.sheet = null; render(); window.scrollTo(0, 0);
+  },
+  'ex-collapse': (el) => { const id = el.dataset.id; ui.exCollapsed.has(id) ? ui.exCollapsed.delete(id) : ui.exCollapsed.add(id); closeBandMenu(); render(); },
+  'ex-move': (el) => { S.moveExercise(el.dataset.id, Number(el.dataset.d)); render(); },
+  equip: (el) => { const ex = S.exById(el.dataset.id); ex.equipment = el.dataset.e; S.save(); render(); },
+  'undo-delete': () => {
+    if (!ui.lastDeleted) return;
+    S.restoreSet(ui.lastDeleted); ui.lastDeleted = null;
+    $('#toast').hidden = true; render();
+  },
   'toggle-session': (el) => {
     const id = el.dataset.id;
     ui.openSessions.has(id) ? ui.openSessions.delete(id) : ui.openSessions.add(id);
     render();
   },
-  'del-session': (el) => { if (confirm('Delete this session and all its sets?')) { S.deleteSession(el.dataset.id); render(); } },
+  'del-session': (el) => { if (confirm('Delete this session and all its sets?')) { S.deleteSession(el.dataset.id); ui.sheet = null; render(); } },
   export: () => {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -1134,11 +1698,32 @@ const actions = {
     if (t.result > 0) logAndCelebrate(t.exId, d);
     render();
   },
-  'rest-add': () => { if (ui.rest) { ui.rest.end += 15000; renderRest(); } },
-  'rest-close': () => { ui.rest = null; renderRest(); },
+  'rest-add': () => {
+    const r = ui.rest;
+    if (!r) return;
+    if (r.paused) r.left += 15; else r.end += 15000;
+    renderRest();
+  },
+  'rest-pause': () => {
+    const r = ui.rest;
+    if (!r || r.done) return;
+    if (r.paused) { r.end = Date.now() + r.left * 1000; r.paused = false; }
+    else { r.left = Math.max(0, (r.end - Date.now()) / 1000); r.paused = true; }
+    renderRest();
+  },
+  'rest-start': () => startRest(),
+  'rest-close': () => { ui.rest = null; renderRest(); if (ui.tab === 'workout') render(); },
 };
 
 document.addEventListener('click', (e) => {
+  if (Date.now() < suppressClickUntil) { suppressClickUntil = 0; e.preventDefault(); e.stopPropagation(); return; }
+  // Record "More options" open/closed right away (the native toggle event is async,
+  // so a quick tap on a setting could otherwise re-render it closed).
+  const sum = e.target.closest('.ex-opts > summary');
+  if (sum) {
+    const det = sum.parentElement, id = det.dataset.opts;
+    det.open ? ui.optsOpen.delete(id) : ui.optsOpen.add(id);
+  }
   const el = e.target.closest('[data-act]');
   // Any tap outside the band dropdown closes it.
   if (ui.bandMenu && !e.target.closest('.dd')) closeBandMenu();
@@ -1153,6 +1738,7 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('input', (e) => {
   const t = e.target;
+  if (t.hasAttribute('data-wk-text')) { updateWorkoutPreview(); return; }
   if (t.hasAttribute('data-picker-search')) { ui.pickerQuery = t.value; applyPickerFilter(); return; }
   if (t.dataset.bind === 'value') draftFor(t.dataset.id).value = Math.max(0, Number(t.value) || 0);
   if (t.dataset.bind === 'kg') draftFor(t.dataset.id).addedKg = Math.max(0, Number(t.value) || 0);
@@ -1167,6 +1753,20 @@ document.addEventListener('change', (e) => {
     b[f] = ['widthMm', 'minKg', 'maxKg'].includes(f) ? Math.max(0, Number(t.value) || 0) : t.value;
     S.save(); render();
   }
+  if (t.hasAttribute?.('data-pf-cluster')) {
+    t.form.querySelector('[data-pf-cluster-fields]').hidden = !t.checked;
+    if (t.checked && !t.form.parts.value) {
+      // Suggest a split of the reps into three parts, e.g. 10 -> 4+3+3.
+      const n = Math.max(2, Number(t.form.value.value) || 6), a = Math.ceil(n / 3), b = Math.round((n - a) / 2);
+      t.form.parts.value = [a, b, n - a - b].filter((x) => x > 0).join('+');
+    }
+  }
+  if (t.dataset.bind === 'level') {
+    const ex = S.exById(t.dataset.id), d = draftFor(ex.id);
+    const next = clamp(Number(t.value) || 0, 0, ex.levels.length - 1);
+    if (next !== d.level) { d.level = next; d.bands = []; d.addedKg = 0; ex.currentLevel = next; S.save(); }
+    render();
+  }
   if (t.name === 'kind' && t.form?.id === 'ex-form') {
     t.form.querySelector('[data-goal-label]').textContent = t.value === 'reps' ? 'Reps to level up' : 'Hold time to level up (seconds)';
   }
@@ -1180,7 +1780,12 @@ document.addEventListener('change', (e) => {
     if (ex.allowBands === false) t.form.band.value = '';
     if (ex.allowWeight === false) t.form.addedKg.value = '';
   }
-  if (t.dataset.setting === 'restSeconds') { state.restSeconds = Math.max(0, Number(t.value) || 0); S.save(); }
+  if (t.dataset.setting === 'restSeconds') { state.restSeconds = Math.max(5, Number(t.value) || 90); S.save(); }
+  if (t.dataset.setting === 'restOn') {
+    state.restOn = t.checked; S.save();
+    if (!t.checked) { ui.rest = null; renderRest(); }
+    render();
+  }
   if (t.hasAttribute('data-import') && t.files?.[0]) {
     t.files[0].text().then((txt) => {
       try {
@@ -1194,7 +1799,117 @@ document.addEventListener('change', (e) => {
   }
 });
 
+// Remember which cards have "More options" open across re-renders.
+document.addEventListener('toggle', (e) => {
+  const id = e.target.dataset?.opts;
+  if (!id) return;
+  e.target.open ? ui.optsOpen.add(id) : ui.optsOpen.delete(id);
+}, true);
+
+// The click that ends a swipe shouldn't also open the set editor.
+let suppressClickUntil = 0;
+
+// ---------- swipe to delete a set ----------
+let swipe = null;
+document.addEventListener('pointerdown', (e) => {
+  const li = e.target.closest('li.swipe');
+  if (!li || e.button > 0) return;
+  swipe = { li, fg: li.querySelector('.swipe-fg'), x0: e.clientX, y0: e.clientY, dx: 0, active: false, id: e.pointerId };
+});
+document.addEventListener('pointermove', (e) => {
+  if (!swipe || e.pointerId !== swipe.id) return;
+  const dx = e.clientX - swipe.x0, dy = e.clientY - swipe.y0;
+  if (!swipe.active) {
+    if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { swipe = null; return; } // vertical scroll wins
+    if (Math.abs(dx) < 8) return;
+    swipe.active = true;
+    swipe.li.classList.add('swiping');
+  }
+  swipe.dx = Math.min(0, dx);
+  swipe.fg.style.transform = `translateX(${swipe.dx}px)`;
+  swipe.li.classList.toggle('armed', swipe.dx < -80);
+});
+const endSwipe = (e) => {
+  if (!swipe || (e && e.pointerId !== swipe.id)) return;
+  const { li, fg, dx, active } = swipe;
+  swipe = null;
+  if (!active) return;
+  suppressClickUntil = Date.now() + 400;
+  li.classList.remove('swiping');
+  if (dx < -80) {
+    fg.style.transform = 'translateX(-110%)';
+    setTimeout(() => {
+      const removed = S.deleteSet(li.dataset.session, li.dataset.set);
+      if (removed) {
+        ui.lastDeleted = removed;
+        toast('Set deleted', { act: 'undo-delete', label: 'Undo' });
+      }
+      render();
+    }, 160);
+  } else {
+    fg.style.transform = '';
+    li.classList.remove('armed');
+  }
+};
+document.addEventListener('pointerup', endSwipe);
+document.addEventListener('pointercancel', endSwipe);
+
 document.addEventListener('submit', (e) => {
+  if (e.target.id === 'set-form') {
+    e.preventDefault();
+    const f = e.target;
+    const patch = {
+      value: f.value.value,
+      level: f.level.value,
+      bands: [...f.querySelectorAll('input[name="band"]:checked')].map((x) => x.value),
+    };
+    if (f.addedKg) patch.addedKg = f.addedKg.value;
+    if (f.tempo) patch.tempo = f.tempo.value;
+    if (!(Number(patch.value) > 0)) { alert('Enter a value above 0, or use Delete set.'); return; }
+    S.updateSet(f.dataset.session, f.dataset.set, patch);
+    ui.sheet = ui.sheetReturn; ui.sheetReturn = null;
+    render();
+    return;
+  }
+  if (e.target.id === 'plan-form') {
+    e.preventDefault();
+    const f = e.target, ex = S.exById(f.dataset.id);
+    const sets = Math.max(1, Number(f.sets.value) || 1);
+    let text = `${sets}x${Math.max(1, Number(f.value.value) || 1)}`;
+    if (f.cluster.checked) {
+      const parts = String(f.parts.value).split('+').map((x) => Number(x.trim())).filter((n) => n > 0);
+      if (parts.length < 2) { alert('Split each set into at least two parts, like 4+3+3.'); return; }
+      text = `${sets}x(${parts.join('+')})/${Math.max(0, Number(f.rest.value) || 0)}s`;
+    }
+    const p = parsePlan(text);
+    applySetup(f, ex);
+    S.setPlan(ex.id, formatPlan(p, ex.kind));
+    draftFor(ex.id).value = p.perSet;
+    ui.sheet = ui.sheetReturn; ui.sheetReturn = null;
+    render();
+    return;
+  }
+  if (e.target.id === 'wk-form') {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const rows = parseWorkoutText(f.get('text') || '', state.exercises.filter((x) => !x.archived));
+    const bad = rows.find((r) => r.error);
+    if (bad) { alert(`${bad.error}. Fix that line and try again.`); return; }
+    if (!rows.length) { alert('Add at least one exercise, one per line.'); return; }
+    const seen = new Set();
+    const items = rows.filter((r) => !seen.has(r.ex.id) && seen.add(r.ex.id))
+      .map((r) => ({ exId: r.ex.id, plan: r.plan ? formatPlan(r.plan, r.ex.kind) : '' }));
+    const name = String(f.get('name') || '').trim() || 'Workout';
+    S.saveWorkout({ id: e.target.dataset.id || null, name, items });
+    ui.sheet = null;
+    if (e.submitter?.value === 'start') {
+      const w = e.target.dataset.id ? state.workouts.find((x) => x.id === e.target.dataset.id) : state.workouts.at(-1);
+      if (S.activeSession()) addWorkoutToSession(w); else { S.startFromWorkout(w.id); ui.drafts = {}; }
+      ui.tab = 'workout';
+    } else toast(`Saved "${name}"`);
+    render();
+    return;
+  }
   if (e.target.id === 'pr-form') {
     e.preventDefault();
     const f = new FormData(e.target);
@@ -1206,7 +1921,7 @@ document.addEventListener('submit', (e) => {
       level: Number(f.get('level')) || 0,
       value,
       bands: band ? [band] : [],
-      bandMode: f.get('bandMode') === 'resist' ? 'resist' : 'assist',
+      bandMode: 'assist',
       addedKg: Number(f.get('addedKg')) || 0,
       tempo: TEMPOS[f.get('tempo')] ? String(f.get('tempo')) : null,
       date: new Date(`${f.get('date')}T12:00`).getTime() || Date.now(),
@@ -1254,10 +1969,14 @@ document.addEventListener('submit', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') { if (ui.timer) closeTimer(); else if (ui.bandMenu) closeBandMenu(); else if (ui.sheet) closeSheet(); }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.matches?.('li.swipe[data-act="set-edit"]')) { e.preventDefault(); e.target.click(); return; }
+  if (e.key === 'Escape') { if (ui.cluster) closeCluster(); else if (ui.timer) closeTimer(); else if (ui.bandMenu) closeBandMenu(); else if (ui.sheet) closeSheet(); }
   if (e.key === ' ' && ui.timer?.phase === 'hold') { e.preventDefault(); stopTimer(); }
 });
 
-setInterval(() => { updateTopbar(); if (ui.rest && !ui.rest.done) renderRest(); }, 500);
+setInterval(() => { updateTopbar(); if (ui.rest && !ui.rest.done && !ui.rest.paused) renderRest(); }, 500);
+// Animation frames stop while the app is in the background; this keeps timer phase
+// changes and beeps happening (browsers still run it, at least once a second).
+setInterval(() => { holdCheck(); clusterCheck(); }, 250);
 
 render();
