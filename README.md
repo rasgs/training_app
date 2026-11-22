@@ -30,8 +30,8 @@ Use **History → Export JSON** for backups.
 - Sets are ranked by **level first**, then **net assistance** (from each band's kg range),
   then **hold time / reps**.
 - Starter progressions follow the r/bodyweightfitness progression chart (v5.4).
-- An exercise is **ready to level up** when its goal (e.g. 15 s) is reached *without an
-  assisting band* in 2 of the last 3 sessions at that level.
+- An exercise is **ready to level up** when its goal hold time or reps (e.g. 15 s) is reached
+  in 2 of the last 3 sessions at that level.
 - The progress chart shows the best set per session. Shaded columns are levels, and each dot is
   colored by the band that assisted it, so you can watch the bands get lighter and then disappear.
 

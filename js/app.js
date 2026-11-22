@@ -151,7 +151,7 @@ function viewWorkoutIdle() {
     <div class="card hero">
       <p class="big-title">Progress by <em>levels</em>,<br>not kilos.</p>
       <p class="muted small" style="margin:0 0 16px">Log the progression step, the band you used and how long you held it.
-      Move up when the goal is clean.</p>
+      Move up a level when you hit the goal.</p>
       <button class="btn primary block big" data-act="start-session">Start session</button>
     </div>
     ${ready.length ? `<h2>Ready to level up</h2>${ready.map(({ ex }) => `
@@ -180,7 +180,7 @@ function exCard(ex, session) {
         <div class="row" style="margin-top:4px">
           <span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${ex.kind === 'static' ? 'Static hold' : 'Reps'}</span>
           ${equipBadge(ex)}
-          <span class="small muted">goal ${fmtVal(ex, ex.goal)} clean</span>
+          <span class="small muted">goal ${fmtVal(ex, ex.goal)}</span>
         </div>
       </div>
       <button class="icon-btn plain" data-act="remove-ex" data-id="${ex.id}" aria-label="Remove ${esc(ex.name)} from session">×</button>
@@ -470,7 +470,7 @@ function sheetEditor(ex) {
           <label class="toggle"><input type="checkbox" name="allowWeight" ${ex.allowWeight !== false ? 'checked' : ''}><span>Added weight</span></label>
         </div>
       </div>
-      <label class="field"><span>Goal to level up (clean, no assist band)</span>
+      <label class="field"><span data-goal-label>${ex.kind === 'reps' ? 'Reps to level up' : 'Hold time to level up (seconds)'}</span>
         <input class="input num" name="goal" type="number" min="1" inputmode="numeric" value="${esc(ex.goal)}"></label>
       <label class="field"><span>Progression levels — one per line, easiest first</span>
         <textarea class="input" name="levels">${esc(ex.levels.join('\n'))}</textarea></label>
@@ -598,7 +598,6 @@ function prRowCompact(ex, pr) {
 
 function prRow(ex, e) {
   return `<li>
-    <span class="pl-lv">L${e.level + 1}</span>
     <span>${esc(e.levelName)} ${tempoTag(e)}<br><span class="small muted">${fmtDay(e.date)}${e.manual ? ' · manual' : ''}${e.note ? ` · ${esc(e.note)}` : ''}</span></span>
     <span class="row" style="justify-content:flex-end">${loadInline(e)}<span class="pl-v">${esc(fmtVal(ex, e.value))}</span></span>
     ${e.manual ? `<button class="icon-btn plain" data-act="pr-del" data-id="${e.id}" aria-label="Delete manual PR">×</button>` : '<span></span>'}
@@ -1167,6 +1166,9 @@ document.addEventListener('change', (e) => {
     const f = t.dataset.field;
     b[f] = ['widthMm', 'minKg', 'maxKg'].includes(f) ? Math.max(0, Number(t.value) || 0) : t.value;
     S.save(); render();
+  }
+  if (t.name === 'kind' && t.form?.id === 'ex-form') {
+    t.form.querySelector('[data-goal-label]').textContent = t.value === 'reps' ? 'Reps to level up' : 'Hold time to level up (seconds)';
   }
   if (t.name === 'exId' && t.form?.id === 'pr-form') {
     const ex = S.exById(t.value);

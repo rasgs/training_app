@@ -343,7 +343,7 @@ export function lastSetsFor(exId, excludeSessionId) {
 }
 
 /**
- * Level-up readiness for the current level: goal met without band assistance
+ * Level-up readiness for the current level: the goal hold time / reps reached
  * in at least 2 of the last 3 sessions trained at this level.
  */
 export function readiness(ex) {
@@ -352,18 +352,18 @@ export function readiness(ex) {
     .map((h) => ({ ...h, sets: h.sets.filter((x) => x.level === lvl) }))
     .filter((h) => h.sets.length);
   const recent = atLevel.slice(-3);
-  const cleanBest = (sets) => Math.max(0, ...sets.filter((x) => !isAssisted(x)).map((x) => x.value));
-  const hits = recent.filter((h) => cleanBest(h.sets) >= ex.goal).length;
+  const best = (sets) => Math.max(0, ...sets.map((x) => x.value));
+  const hits = recent.filter((h) => best(h.sets) >= ex.goal).length;
   const allSets = atLevel.flatMap((h) => h.sets);
-  const bestClean = cleanBest(allSets);
+  const bestValue = best(allSets);
   const bestAny = bestOf(allSets);
   const isLast = lvl >= ex.levels.length - 1;
   return {
     hits,
     ready: hits >= 2 && !isLast,
-    bestClean,
+    bestValue,
     bestAny,
-    pct: Math.min(1, bestClean / (ex.goal || 1)),
+    pct: Math.min(1, bestValue / (ex.goal || 1)),
     sessionsAtLevel: atLevel.length,
     isLast,
   };
