@@ -1,4 +1,4 @@
-"""Local dev server for Ladder: static files with caching disabled.
+"""Local dev server for CaliTracker: static files with caching disabled.
 
 Usage: python3 serve.py [port]   (default 5173)
 Add --host 0.0.0.0 to open it from your phone on the same Wi-Fi.
@@ -28,7 +28,7 @@ def main():
     port = int(args[0]) if args else 5173
     handler = partial(NoCacheHandler, directory=str(Path(__file__).parent))
     with http.server.ThreadingHTTPServer((host, port), handler) as httpd:
-        print(f"Ladder running at http://{host}:{port}")
+        print(f"CaliTracker running at http://{host}:{port}")
         httpd.serve_forever()
 
 

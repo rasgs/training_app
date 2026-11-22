@@ -193,6 +193,16 @@ export function isValidState(s) {
 
 export const state = load();
 
+// A session with no exercises and no sets is a leftover (e.g. the picker was
+// closed right after "Start session"); drop it so no clock runs for nothing.
+{
+  const s = state.sessions.find((x) => x.id === state.activeSessionId);
+  if (s && !s.sets.length && !s.exerciseIds.length) {
+    state.sessions = state.sessions.filter((x) => x !== s);
+    state.activeSessionId = null;
+  }
+}
+
 export function save() {
   try { localStorage.setItem(KEY, JSON.stringify(state)); } catch { /* ignore */ }
 }

@@ -1,4 +1,4 @@
-/* Ladder — calisthenics log. Dark "chalk on iron" by default, light theme via prefers-color-scheme. */
+/* CaliTracker — calisthenics log. Dark "chalk on iron" by default, light theme via prefers-color-scheme. */
 :root {
   --bg: #121311;
   --surface: #1b1d1a;
@@ -418,3 +418,25 @@ textarea.input { min-height: 160px; resize: vertical; line-height: 1.6; }
 }
 .toggle input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
 .toggle:has(input:checked) { border-color: var(--text); }
+
+/* add-exercise picker: search + collapsible groups */
+.picker-tools { display: flex; gap: 8px; align-items: center; position: sticky; top: 46px; z-index: 1; background: var(--bg); padding: 2px 0 8px; }
+.picker-tools .input { flex: 1; }
+.pick-group { margin-top: 6px; }
+.pick-head {
+  width: 100%; display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 4px;
+  background: none; border: 0; border-bottom: 1px solid var(--line); text-align: left;
+}
+.pick-head .dot { width: 8px; height: 8px; border-radius: 50%; }
+.pick-head .pick-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+.pick-chev { color: var(--muted); font-size: 13px; transition: transform .15s; }
+.pick-group.collapsed:not(.searching) .pick-list { display: none; }
+.pick-group.collapsed:not(.searching) .pick-chev { transform: rotate(-90deg); }
+
+button.topbar-meta { white-space: nowrap; flex: none; background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; color: var(--text); font-size: 13px; }
+button.topbar-meta::before { content: '●'; color: var(--accent); margin-right: 6px; font-size: 10px; vertical-align: 1px; }
+
+/* Page header row (title + action/toggle): consistent gap before the content below */
+.view-head { margin: 4px 0 14px; }
+.view-head h2 { margin: 0; }
+.view-head + .gfilter { margin-top: 0; }

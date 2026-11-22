@@ -12,6 +12,8 @@ const ui = {
   calGroups: new Set(), // calendar muscle-group filter (empty = all)
   prGroups: new Set(),  // PR view muscle-group filter
   prOpen: new Set(),    // exercises expanded in the PR overview
+  pickerQuery: '',      // add-exercise search text
+  pickerCollapsed: new Set(), // collapsed groups in the add-exercise sheet
   drafts: {},          // exId -> { level, bands[], bandMode, value, addedKg } for the active session
   sheet: null,         // { type, id }
   timer: null,         // hold timer state
@@ -298,7 +300,7 @@ function viewSkills() {
   const archived = state.exercises.filter((e) => e.archived);
   const groups = GROUPS.map((g) => ({ g, items: list.filter((e) => (e.group || 'Other') === g) })).filter((x) => x.items.length);
   return `
-    <div class="spread"><h2>Progressions</h2><button class="btn sm" data-act="edit-ex" data-id="new">+ New</button></div>
+    <div class="spread view-head"><h2>Progressions</h2><button class="btn sm" data-act="edit-ex" data-id="new">+ New</button></div>
     ${groups.map(({ g, items }) => `
       <div class="label" style="margin:16px 0 8px">${esc(g)}</div>
       ${items.map(skillCard).join('')}`).join('')}
@@ -472,24 +474,59 @@ function sheetEditor(ex) {
 function sheetPicker() {
   const s = S.activeSession();
   const list = state.exercises.filter((e) => !e.archived);
+  const groups = GROUPS.map((g) => ({ g, items: list.filter((e) => (e.group || 'Other') === g) })).filter((x) => x.items.length);
+  const allCollapsed = groups.every(({ g }) => ui.pickerCollapsed.has(g));
   return `
     <div class="sheet-head">
       <h2>Add exercise</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
     </div>
-    ${GROUPS.map((g) => {
-      const items = list.filter((e) => (e.group || 'Other') === g);
-      if (!items.length) return '';
-      return `<div class="label" style="margin-top:14px">${g}</div>
+    <div class="picker-tools">
+      <input class="input" type="search" placeholder="Search exercises or levels…" value="${esc(ui.pickerQuery)}"
+        data-picker-search aria-label="Search exercises" autocomplete="off" enterkeyhint="search">
+      <button class="btn sm ghost" data-act="picker-collapse-all">${allCollapsed ? 'Expand all' : 'Collapse all'}</button>
+    </div>
+    ${groups.map(({ g, items }) => `
+      <section class="pick-group ${ui.pickerCollapsed.has(g) ? 'collapsed' : ''}" data-group="${g}">
+        <button class="pick-head" data-act="picker-group" data-g="${g}" aria-expanded="${!ui.pickerCollapsed.has(g)}">
+          <span class="dot g-${g.toLowerCase()}"></span><span class="label">${g}</span>
+          <span class="small muted pick-count">${items.length}</span><span class="pick-chev">▾</span>
+        </button>
         <ul class="pick-list">${items.map((ex) => {
           const added = s?.exerciseIds.includes(ex.id);
-          return `<li class="${added ? 'added' : ''}" data-act="pick-ex" data-id="${ex.id}">
+          const search = [ex.name, g, EQUIPMENT[ex.equipment] || '', ...ex.levels].join(' ').toLowerCase();
+          return `<li class="${added ? 'added' : ''}" data-act="pick-ex" data-id="${ex.id}" data-search="${esc(search)}">
             <span><b>${esc(ex.name)}</b><br><span class="small muted">L${ex.currentLevel + 1} · ${esc(ex.levels[ex.currentLevel])}${ex.equipment && ex.equipment !== 'none' ? ` · ${EQUIPMENT[ex.equipment]}` : ''}</span></span>
             <span class="badge ${ex.kind === 'static' ? 'kind-static' : ''}">${added ? 'Added' : ex.kind === 'static' ? 'Hold' : 'Reps'}</span>
           </li>`;
-        }).join('')}</ul>`;
-    }).join('')}
+        }).join('')}</ul>
+      </section>`).join('')}
+    <div class="empty small" data-picker-empty hidden>No exercise matches. Create it as a new progression below.</div>
     <button class="btn block ghost" style="margin-top:14px" data-act="edit-ex" data-id="new">+ Create new progression</button>`;
+}
+
+/**
+ * Filter the picker in place (no re-render, so the search box keeps focus).
+ * While searching, groups with matches are shown expanded regardless of collapse state.
+ */
+function applyPickerFilter() {
+  const q = ui.pickerQuery.trim().toLowerCase();
+  const terms = q.split(/\s+/).filter(Boolean);
+  let any = false;
+  document.querySelectorAll('.pick-group').forEach((sec) => {
+    let n = 0;
+    sec.querySelectorAll('li[data-search]').forEach((li) => {
+      const hit = terms.every((t) => li.dataset.search.includes(t));
+      li.hidden = !hit;
+      if (hit) n++;
+    });
+    sec.hidden = n === 0;
+    sec.classList.toggle('searching', terms.length > 0);
+    sec.querySelector('.pick-count').textContent = n;
+    if (n) any = true;
+  });
+  const empty = document.querySelector('[data-picker-empty]');
+  if (empty) empty.hidden = any;
 }
 
 // ---------- PRs ----------
@@ -505,7 +542,7 @@ function viewPRs() {
   const recent = S.recentPRs(50).filter((ev) => inGroups(ev.ex, f)).slice(0, 4);
   const groups = GROUPS.map((g) => ({ g, items: rows.filter((r) => (r.ex.group || 'Other') === g) })).filter((x) => x.items.length);
   return `
-    <div class="spread"><h2>Personal records</h2><button class="btn sm" data-act="pr-add">+ Add PR</button></div>
+    <div class="spread view-head"><h2>Personal records</h2><button class="btn sm" data-act="pr-add">+ Add PR</button></div>
     ${groupFilter(f, 'pr-group').replace('class="gfilter"', 'class="gfilter left"')}
 
     ${recent.length ? `
@@ -570,7 +607,7 @@ function sheetAddPR(exId) {
       <h2>Add PR</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="Close">×</button>
     </div>
-    <p class="small muted" style="margin-top:0">For records set outside a logged session, or before you used Ladder.</p>
+    <p class="small muted" style="margin-top:0">For records set outside a logged session, or before you used CaliTracker.</p>
     <form class="stack" id="pr-form">
       <label class="field"><span>Exercise</span>
         <select class="input" name="exId">
@@ -613,7 +650,7 @@ function sheetAddPR(exId) {
 function viewBands() {
   const bands = [...state.bands].sort((a, b) => (a.widthMm || 0) - (b.widthMm || 0));
   return `
-    <div class="spread"><h2>Band inventory</h2><button class="btn sm" data-act="add-band">+ Band</button></div>
+    <div class="spread view-head"><h2>Band inventory</h2><button class="btn sm" data-act="add-band">+ Band</button></div>
     <p class="small muted" style="margin-top:0">Color and width identify the band. The kg range is used to rank assisted sets
       (lighter assist = progress). Combine several bands when logging.</p>
     ${bands.map((b) => `
@@ -732,7 +769,7 @@ function viewHistory() {
   const sessions = [...state.sessions].sort((a, b) => b.startedAt - a.startedAt);
   const mode = state.historyView === 'calendar' ? 'calendar' : 'list';
   return `
-    <div class="spread">
+    <div class="spread view-head">
       <h2>Sessions</h2>
       <div class="seg" role="group" aria-label="History view">
         <button data-act="history-view" data-v="list" aria-pressed="${mode === 'list'}">List</button>
@@ -786,6 +823,7 @@ function renderSheet() {
   wrap.innerHTML = `<div class="sheet" role="dialog" aria-modal="true"><div class="sheet-grip"></div>${body}</div>`;
   wrap.hidden = false;
   wrap.querySelector('.sheet').scrollTop = scroll;
+  if (type === 'picker') applyPickerFilter();
 }
 
 function openSheet(type, id) { ui.sheet = { type, id }; renderSheet(); }
@@ -794,7 +832,10 @@ function closeSheet() { ui.sheet = null; renderSheet(); }
 // ---------- topbar ----------
 function updateTopbar() {
   const s = S.activeSession();
-  $('#topbar-meta').textContent = s ? `● ${fmtClock((Date.now() - s.startedAt) / 1000)} · ${s.sets.length} sets` : '';
+  const el = $('#topbar-meta');
+  el.textContent = s ? `Session ${fmtClock((Date.now() - s.startedAt) / 1000)}` : '';
+  if (s) el.title = `${s.sets.length} set${s.sets.length === 1 ? '' : 's'} logged`;
+  el.hidden = !s;
 }
 
 // ================= HOLD TIMER =================
@@ -946,14 +987,32 @@ function toggleGroup(set, g) {
 
 const actions = {
   tab: (el) => { ui.tab = el.dataset.tab; ui.sheet = null; render(); window.scrollTo(0, 0); },
-  'start-session': () => { S.startSession(); ui.drafts = {}; render(); openSheet('picker'); },
+  // The session itself starts when the first exercise is picked (see pick-ex).
+  'start-session': () => { ui.drafts = {}; ui.pickerQuery = ''; openSheet('picker'); },
   'finish-session': () => {
     const s = S.activeSession();
     if (s && s.sets.length === 0 && !confirm('No sets logged. Discard this session?')) return;
     S.finishSession(); ui.drafts = {}; ui.rest = null; renderRest(); render();
   },
-  'open-picker': () => openSheet('picker'),
-  'pick-ex': (el) => { S.addExerciseToSession(el.dataset.id); closeSheet(); render(); },
+  'open-picker': () => { ui.pickerQuery = ''; openSheet('picker'); },
+  'picker-group': (el) => {
+    const g = el.dataset.g;
+    const collapsed = !ui.pickerCollapsed.has(g);
+    collapsed ? ui.pickerCollapsed.add(g) : ui.pickerCollapsed.delete(g);
+    const sec = el.closest('.pick-group');
+    sec.classList.toggle('collapsed', collapsed);
+    el.setAttribute('aria-expanded', String(!collapsed));
+  },
+  'picker-collapse-all': () => {
+    const gs = [...document.querySelectorAll('.pick-group')].map((x) => x.dataset.group);
+    const collapse = !gs.every((g) => ui.pickerCollapsed.has(g));
+    gs.forEach((g) => (collapse ? ui.pickerCollapsed.add(g) : ui.pickerCollapsed.delete(g)));
+    renderSheet();
+  },
+  'pick-ex': (el) => {
+    if (!S.activeSession()) S.startSession();
+    S.addExerciseToSession(el.dataset.id); closeSheet(); ui.tab = 'workout'; render();
+  },
   'remove-ex': (el) => {
     const s = S.activeSession();
     const n = s?.sets.filter((x) => x.exId === el.dataset.id).length || 0;
@@ -1043,7 +1102,7 @@ const actions = {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `ladder-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `calitracker-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   },
@@ -1082,6 +1141,7 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('input', (e) => {
   const t = e.target;
+  if (t.hasAttribute('data-picker-search')) { ui.pickerQuery = t.value; applyPickerFilter(); return; }
   if (t.dataset.bind === 'value') draftFor(t.dataset.id).value = Math.max(0, Number(t.value) || 0);
   if (t.dataset.bind === 'kg') draftFor(t.dataset.id).addedKg = Math.max(0, Number(t.value) || 0);
 });
@@ -1110,7 +1170,7 @@ document.addEventListener('change', (e) => {
     t.files[0].text().then((txt) => {
       try {
         const next = JSON.parse(txt);
-        if (!S.isValidState(next)) throw new Error('not a Ladder backup');
+        if (!S.isValidState(next)) throw new Error('not a CaliTracker backup');
         if (!confirm('Replace all current data with this backup?')) return;
         next.activeSessionId ??= null;
         S.replaceState(S.migrate(next)); ui.drafts = {}; render();
@@ -1170,7 +1230,10 @@ document.addEventListener('submit', (e) => {
   }
   S.save();
   // From the workout picker, a new exercise goes straight into the session.
-  if (id === 'new' && ui.tab === 'workout' && S.activeSession()) { S.addExerciseToSession(ex.id); ui.sheet = null; }
+  if (id === 'new' && ui.tab === 'workout') {
+    if (!S.activeSession()) S.startSession();
+    S.addExerciseToSession(ex.id); ui.sheet = null;
+  }
   else ui.sheet = { type: 'ex', id: ex.id };
   render();
 });

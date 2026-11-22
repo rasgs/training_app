@@ -1,6 +1,6 @@
 {
-  "name": "Ladder — calisthenics log",
-  "short_name": "Ladder",
+  "name": "CaliTracker — calisthenics log",
+  "short_name": "CaliTracker",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#121311",

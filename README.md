@@ -1,8 +1,8 @@
-# Ladder — calisthenics log
+# CaliTracker — calisthenics log
 
 In calisthenics you don't progress by adding weight. You progress by moving up a
 **progression ladder** (tuck → advanced tuck → straddle → full), by **needing less band
-assistance**, and by **holding longer** or doing more reps. Ladder logs exactly those things.
+assistance**, and by **holding longer** or doing more reps. CaliTracker logs exactly those things.
 
 ## Run
 
